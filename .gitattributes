@@ -1,0 +1,5 @@
+# Script chạy trong container Linux phải giữ xuống dòng LF (CRLF làm bash báo lỗi)
+*.sh text eol=lf
+docker/**/*.sql text eol=lf
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf

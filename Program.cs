@@ -65,7 +65,10 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins("http://localhost:5173", "http://localhost:5174")
+        // Thêm tên miền khi đưa web lên mạng (VD trang đặt trước riêng) vào "Cors:AllowedOrigins" trong appsettings.json
+        var origins = (builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? Array.Empty<string>())
+            .Where(o => !string.IsNullOrWhiteSpace(o)).ToArray();
+        policy.WithOrigins(new[] { "http://localhost:5173", "http://localhost:5174" }.Concat(origins).ToArray())
               .AllowAnyHeader()
               .AllowAnyMethod()
               .AllowCredentials();

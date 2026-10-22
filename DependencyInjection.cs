@@ -10,6 +10,8 @@ using SystemBase.BE.Services.ErrorLog;
 using SystemBase.BE.Services.System.Email;
 using SystemBase.BE.Infrastructure.Dapper;
 
+using SystemBase.BE.Services.Squishy;
+
 namespace SystemBase.BE
 {
     public static class DependencyInjection
@@ -29,6 +31,19 @@ namespace SystemBase.BE
             services.AddScoped<IActionLogService, ActionLogService>();
             services.AddScoped<IErrorLogService, ErrorLogService>();
             services.AddScoped<ISystemSecuritySettingService, SystemSecuritySettingService>();
+
+            // Đăng ký Squishy Store Services
+            services.AddScoped<IMediaService, MediaService>();
+            services.AddScoped<ICategoryService, CategoryService>();
+            services.AddScoped<IProductService, ProductService>();
+            services.AddScoped<IGoodsReceiptService, GoodsReceiptService>();
+            services.AddScoped<IOrderService, OrderService>();
+            services.AddScoped<IPaymentService, PaymentService>();
+            services.AddScoped<IReportService, ReportService>();
+            services.AddScoped<IReturnService, ReturnService>();
+            services.AddScoped<IPreorderService, PreorderService>();
+            services.AddScoped<ICashTransactionService, CashTransactionService>();
+
             services.AddHttpContextAccessor();
 
             return services;
