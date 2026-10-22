@@ -23,7 +23,10 @@ services:
 
   # ===== Tạo database + bảng + dữ liệu người dùng (chạy xong thì tự thoát) =====
   db-init:
-    image: mcr.microsoft.com/mssql/server:2025-latest
+    build:
+      context: ./docker/db
+    image: squishypop-db-init:latest
+    pull_policy: build
     depends_on:
       mssql:
         condition: service_healthy
@@ -31,9 +34,6 @@ services:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
       DB_NAME: ${DB_NAME:-SquishyPop}
       DB_HOST: mssql
-    volumes:
-      - ./docker/db:/docker-db:ro
-    entrypoint: ["/bin/bash", "/docker-db/run-init.sh"]
     restart: "no"
 
   # ===== Backend .NET =====
