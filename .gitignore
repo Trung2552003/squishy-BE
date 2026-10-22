@@ -482,3 +482,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Cấu hình riêng máy dev (chứa mật khẩu database của server)
+appsettings.Local.json

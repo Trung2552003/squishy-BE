@@ -18,8 +18,17 @@ done
 
 "$SQLCMD" "${ARGS[@]}" -Q "IF DB_ID(N'$DB') IS NULL BEGIN CREATE DATABASE [$DB] COLLATE SQL_Latin1_General_CP1_CI_AS; PRINT N'Đã tạo database $DB'; END"
 
+# Database mới tinh = chưa có bảng User. Chỉ lúc đó mới nạp dữ liệu mẫu (file có chữ "seed"),
+# để các lần deploy sau không thêm lại người dùng / quyền mà bạn đã xóa trong CMS.
+FRESH=$("$SQLCMD" "${ARGS[@]}" -d "$DB" -h -1 -W -Q "SET NOCOUNT ON; SELECT CASE WHEN OBJECT_ID(N'dbo.[User]', 'U') IS NULL THEN 1 ELSE 0 END" | tr -d '[:space:]')
+
 for f in /docker-db/init/*.sql; do
-    echo "==> $(basename "$f")"
+    name=$(basename "$f")
+    if [[ "$name" == *seed* && "$FRESH" != "1" ]]; then
+        echo "==> $name: bỏ qua (database đã có dữ liệu, chỉ nạp dữ liệu mẫu lần đầu)"
+        continue
+    fi
+    echo "==> $name"
     "$SQLCMD" "${ARGS[@]}" -d "$DB" -i "$f"
 done
 

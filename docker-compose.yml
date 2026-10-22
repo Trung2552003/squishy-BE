@@ -12,6 +12,11 @@ services:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Chưa đặt MSSQL_SA_PASSWORD}
       MSSQL_PID: ${MSSQL_PID:-Express}
       TZ: Asia/Ho_Chi_Minh
+    # Cổng SQL Server trên server. Mặc định chỉ mở cho chính server (127.0.0.1) để kết nối qua đường hầm SSH:
+    #   ssh -L 14330:127.0.0.1:1433 <user>@<server>   rồi dùng localhost,14330 trên máy bạn.
+    # Muốn mở ra Internet: đặt MSSQL_BIND_IP=0.0.0.0 (nhớ chặn firewall chỉ cho IP của bạn).
+    ports:
+      - "${MSSQL_BIND_IP:-127.0.0.1}:${MSSQL_PUBLIC_PORT:-1433}:1433"
     volumes:
       - mssql-data:/var/opt/mssql
     healthcheck:

@@ -38,6 +38,7 @@ Portainer → **Stacks → Add stack**
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | | Gmail + App Password, để gửi mail quên mật khẩu |
 | `FE_GIT_CONTEXT` | | Repo FE private: `https://<user>:<token>@github.com/Trung2552003/Squishy-FE.git#main` |
 | `DB_NAME`, `MSSQL_PID` | | Mặc định `SquishyPop`, `Express` |
+| `MSSQL_BIND_IP`, `MSSQL_PUBLIC_PORT` | | Mặc định `127.0.0.1:1433`: chỉ kết nối qua đường hầm SSH. `0.0.0.0` = mở ra Internet |
 
 Bấm **Deploy the stack**. Lần đầu mất vài phút (tải image + build). Xem log container `db-init`: thấy dòng `Database SquishyPop đã sẵn sàng.` là xong.
 
@@ -76,4 +77,16 @@ docker cp squishypop-mssql-1:/var/opt/mssql/data/SquishyPop.bak ./SquishyPop-$(d
 - `appsettings.json` trong repo đang chứa JWT secret và mật khẩu Gmail dùng lúc phát triển. Bản Docker đã ghi đè bằng biến môi trường,
   nhưng nên **đổi App Password Gmail** và xóa các giá trị đó khỏi repo nếu repo từng public.
 - `docker/db/init/02_seed.sql` chứa mã băm mật khẩu của tài khoản hiện có → giữ repo ở chế độ **private**.
-- Không mở cổng 1433 của SQL Server ra ngoài (compose mặc định không mở).
+- SQL Server mặc định chỉ mở cho chính server; kết nối từ máy bạn qua đường hầm SSH (mục 7). Nếu đặt `MSSQL_BIND_IP=0.0.0.0`
+  thì dùng mật khẩu `sa` thật mạnh và chặn firewall chỉ cho IP của bạn (VD `ufw allow from <IP-của-bạn> to any port 1433`).
+
+## 7. Kết nối database trên server từ máy bạn (đường hầm SSH)
+
+```bash
+# Giữ cửa sổ này mở trong lúc làm việc. 14330 là cổng trên máy bạn (tránh trùng SQL Server cài sẵn ở 1433)
+ssh -N -L 14330:127.0.0.1:1433 <user>@<ip-server>
+```
+
+- **SSMS / Azure Data Studio:** Server `localhost,14330`, SQL Login `sa`, mật khẩu `MSSQL_SA_PASSWORD`, tích *Trust server certificate*.
+- **Chạy backend trên máy bạn với database của server:** copy `appsettings.Local.example.json` thành `appsettings.Local.json`,
+  điền mật khẩu. File này nằm trong `.gitignore` nên mật khẩu không lên GitHub; xóa file đi là backend quay lại dùng database trên máy.

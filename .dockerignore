@@ -10,3 +10,4 @@ docker-compose.yml
 *.sql
 # Ảnh tải lên lúc chạy thử trên máy: server bắt đầu với dữ liệu trống
 wwwroot/uploads/
+appsettings.Local.json

@@ -11,6 +11,13 @@ using Microsoft.Extensions.FileProviders;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Cấu hình riêng trên máy dev (VD chuỗi kết nối tới database của server qua đường hầm SSH).
+// File không commit lên git; chỉ đọc khi chạy Development để không đè biến môi trường của bản Docker.
+if (builder.Environment.IsDevelopment())
+{
+    builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
+}
+
 // Cấu hình DI
 builder.Services.AddApplicationServices();
 
