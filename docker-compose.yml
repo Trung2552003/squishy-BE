@@ -63,8 +63,8 @@ services:
   # ===== Frontend (nginx phục vụ web + chuyển /api, /hubs, /uploads sang backend) =====
   frontend:
     build:
-      # Repo frontend riêng. Repo private: https://<github-user>:<token>@github.com/ducmannh/SystemBase-FE.git#main
-      context: ${FE_GIT_CONTEXT:-https://github.com/ducmannh/SystemBase-FE.git#main}
+      # Repo frontend riêng. Repo private: https://<github-user>:<token>@github.com/Trung2552003/Squishy-FE.git#main
+      context: ${FE_GIT_CONTEXT:-https://github.com/Trung2552003/Squishy-FE.git#main}
       dockerfile: Dockerfile
     image: squishypop-frontend:latest
     pull_policy: build

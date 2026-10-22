@@ -13,8 +13,8 @@ Trình duyệt ──► frontend:80 (nginx) ──► backend:8080 ──► ms
 
 - Server Linux có Docker, Portainer, **git** (Docker cần git để build frontend từ repo) và **RAM tối thiểu 4GB** (SQL Server cần ~2GB).
 - Commit và push cả hai repo lên nhánh `main`:
-  - `SystemBase-BE` (có `Dockerfile`, `docker-compose.yml`, `docker/db/`)
-  - `SystemBase-FE` (có `Dockerfile`, `nginx.conf`)
+  - `squishy-BE` (có `Dockerfile`, `docker-compose.yml`, `docker/db/`)
+  - `Squishy-FE` (có `Dockerfile`, `nginx.conf`)
 
 ## 2. Tạo stack
 
@@ -23,7 +23,7 @@ Portainer → **Stacks → Add stack**
 | Mục | Giá trị |
 |---|---|
 | Build method | **Repository** |
-| Repository URL | `https://github.com/ducmannh/SystemBase-BE` |
+| Repository URL | `https://github.com/Trung2552003/squishy-BE` |
 | Repository reference | `refs/heads/main` |
 | Compose path | `docker-compose.yml` |
 | Authentication | Bật nếu repo private (GitHub user + Personal Access Token) |
@@ -36,7 +36,7 @@ Portainer → **Stacks → Add stack**
 | `JWT_SECRET` | ✅ | Chuỗi ngẫu nhiên ≥ 64 ký tự |
 | `WEB_PORT` | | Mặc định `8080` |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | | Gmail + App Password, để gửi mail quên mật khẩu |
-| `FE_GIT_CONTEXT` | | Repo FE private: `https://<user>:<token>@github.com/ducmannh/SystemBase-FE.git#main` |
+| `FE_GIT_CONTEXT` | | Repo FE private: `https://<user>:<token>@github.com/Trung2552003/Squishy-FE.git#main` |
 | `DB_NAME`, `MSSQL_PID` | | Mặc định `SquishyPop`, `Express` |
 
 Bấm **Deploy the stack**. Lần đầu mất vài phút (tải image + build). Xem log container `db-init`: thấy dòng `Database SquishyPop đã sẵn sàng.` là xong.
