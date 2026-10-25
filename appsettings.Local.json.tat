@@ -1,0 +1,5 @@
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=localhost,14330;Database=SquishyPop;User Id=sa;Password=<MAT-KHAU-SA>;TrustServerCertificate=True;"
+  }
+}
