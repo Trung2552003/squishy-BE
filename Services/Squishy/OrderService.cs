@@ -72,7 +72,8 @@ public class OrderService : IOrderService
     public async Task<RestData<List<OrderDto>>> GetFulfillmentOrdersAsync(string? prepStatus = null)
     {
         using var connection = _connectionFactory.CreateConnection();
-        var whereClause = "IsDeleted = 0 AND OrderStatus <> 'CANCELLED'";
+        // Chỉ đơn giao hàng (khách đặt trên web) mới cần đóng gói / giao shipper; đơn tại quầy đã giao tay ngay
+        var whereClause = "IsDeleted = 0 AND OrderStatus <> 'CANCELLED' AND OrderType <> 'POS'";
         var parameters = new DynamicParameters();
 
         if (!string.IsNullOrWhiteSpace(prepStatus))
@@ -364,6 +365,12 @@ public class OrderService : IOrderService
     public async Task<RestData<OrderDto>> UpdateFulfillmentAsync(Guid id, UpdateFulfillmentRequest request)
     {
         using var connection = _connectionFactory.CreateConnection();
+        var orderType = await connection.ExecuteScalarAsync<string?>(
+            "SELECT OrderType FROM [Order] WHERE Id = @Id AND IsDeleted = 0", new { Id = id });
+        if (orderType == null)
+            return FailOrder("Không tìm thấy đơn hàng.");
+        if (orderType == "POS")
+            return FailOrder("Đơn bán tại quầy đã giao tận tay khách, không cần đóng gói / giao shipper.");
         var sql = @"
             UPDATE [Order] 
             SET PreparationStatus = @PreparationStatus,
