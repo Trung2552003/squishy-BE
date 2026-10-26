@@ -22,7 +22,7 @@ public class Order
 
     // Thông tin giao hàng
     public string? ShippingAddress { get; set; }
-    public string? ShippingProvider { get; set; } // GHTK, GHN, ViettelPost, GrabExpress
+    public string? ShippingProvider { get; set; } // GHTK, GHN, ViettelPost, SPX, GrabExpress, ShipperNoiBo
     public string? TrackingCode { get; set; }
     public decimal ShippingFee { get; set; }        // phí trả cho đơn vị vận chuyển
     public string ShippingPayer { get; set; } = "RECEIVER"; // RECEIVER: khách trả (cộng vào tổng) | SENDER: shop trả (chi phí của shop)
