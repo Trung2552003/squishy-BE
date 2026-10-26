@@ -401,9 +401,11 @@ public class OrderService : IOrderService
             UPDATE [Order] SET PaymentProofImageUrl = @Url, UpdatedAt = GETDATE() WHERE Id = @Id",
             new { Id = orderId, Url = imageUrl });
 
+        // Ảnh tải qua /Media/upload-image đã có dòng MediaImage gắn với đơn, chỉ thêm khi chưa có (tránh ảnh bị nhân đôi)
         await connection.ExecuteAsync(@"
-            INSERT INTO MediaImage (Id, EntityId, EntityType, Url, FileName, IsPrimary, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
-            VALUES (NEWID(), @EntityId, 'ORDER_PAYMENT', @Url, 'payment_proof.jpg', 1, 1, GETDATE(), GETDATE(), 0)",
+            IF NOT EXISTS (SELECT 1 FROM MediaImage WHERE EntityId = @EntityId AND EntityType = 'ORDER_PAYMENT' AND Url = @Url AND IsDeleted = 0)
+                INSERT INTO MediaImage (Id, EntityId, EntityType, Url, FileName, IsPrimary, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
+                VALUES (NEWID(), @EntityId, 'ORDER_PAYMENT', @Url, 'payment_proof.jpg', 1, 1, GETDATE(), GETDATE(), 0)",
             new { EntityId = orderId, Url = imageUrl });
 
         return new RestData<bool> { IsSuccess = true, Data = true, Message = "Đã cập nhật ảnh chứng minh thanh toán." };
