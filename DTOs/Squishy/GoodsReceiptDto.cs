@@ -12,6 +12,7 @@ public class GoodsReceiptItemDto
     public int Quantity { get; set; }
     public decimal UnitPrice { get; set; }
     public decimal TotalPrice { get; set; }
+    public decimal? LandedUnitCost { get; set; }
 }
 
 public class GoodsReceiptDto
@@ -22,7 +23,10 @@ public class GoodsReceiptDto
     public string? SupplierName { get; set; }
     public DateTime ReceiptDate { get; set; }
     public decimal TotalAmount { get; set; }
+    public decimal ShippingFee { get; set; }
     public string Status { get; set; } = "COMPLETED";
+    public DateTime? CancelledAt { get; set; }
+    public string? CancelReason { get; set; }
     public string? Note { get; set; }
     public DateTime CreatedAt { get; set; }
     public List<GoodsReceiptItemDto> Details { get; set; } = new();
@@ -41,7 +45,13 @@ public class CreateGoodsReceiptDto
     public string? SupplierName { get; set; }
     public DateTime? ReceiptDate { get; set; }
     public string? Note { get; set; }
+    public decimal ShippingFee { get; set; }
     public List<CreateGoodsReceiptItemDto> Items { get; set; } = new();
+}
+
+public class CancelGoodsReceiptDto
+{
+    public string? Reason { get; set; }
 }
 
 public class SupplierDto

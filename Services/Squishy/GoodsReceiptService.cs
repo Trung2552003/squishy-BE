@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -15,6 +16,7 @@ public interface IGoodsReceiptService
     Task<RestData<List<GoodsReceiptDto>>> GetAllAsync();
     Task<RestData<GoodsReceiptDto>> GetByIdAsync(Guid id);
     Task<RestData<GoodsReceiptDto>> CreateReceiptAsync(CreateGoodsReceiptDto dto);
+    Task<RestData<GoodsReceiptDto>> CancelReceiptAsync(Guid id, string? reason);
     Task<RestData<List<SupplierDto>>> GetSuppliersAsync();
     Task<RestData<SupplierDto>> CreateSupplierAsync(SupplierDto dto);
     Task<RestData<List<StockMovementReportDto>>> GetStockTransactionsAsync(Guid? productId = null);
@@ -71,7 +73,11 @@ public class GoodsReceiptService : IGoodsReceiptService
     public async Task<RestData<GoodsReceiptDto>> CreateReceiptAsync(CreateGoodsReceiptDto dto)
     {
         if (dto.Items == null || !dto.Items.Any())
-            return new RestData<GoodsReceiptDto> { IsSuccess = false, Message = "Phiếu nhập phải có ít nhất 1 sản phẩm." };
+            return Fail("Phiếu nhập phải có ít nhất 1 sản phẩm.");
+        if (dto.Items.Any(i => i.Quantity <= 0))
+            return Fail("Số lượng nhập phải lớn hơn 0.");
+        if (dto.Items.Any(i => i.UnitPrice < 0) || dto.ShippingFee < 0)
+            return Fail("Giá nhập và phí vận chuyển không được âm.");
 
         using var connection = _connectionFactory.CreateConnection();
         connection.Open();
@@ -79,93 +85,73 @@ public class GoodsReceiptService : IGoodsReceiptService
 
         try
         {
-            // Sinh mã phiếu nhập PN-YYYYMMDD-XXXX
+            var productIds = dto.Items.Select(i => i.ProductId).Distinct().ToList();
+            var existing = await connection.ExecuteScalarAsync<int>(
+                "SELECT COUNT(1) FROM Product WHERE Id IN @Ids AND IsDeleted = 0", new { Ids = productIds }, transaction);
+            if (existing != productIds.Count)
+                return Fail("Có sản phẩm không còn tồn tại. Vui lòng tải lại trang.");
+
+            // Sinh mã phiếu nhập PN-yyyyMMdd-###
             var dateStr = DateTime.Now.ToString("yyyyMMdd");
             var countToday = await connection.ExecuteScalarAsync<int>(
-                "SELECT COUNT(1) FROM GoodsReceipt WHERE Code LIKE @Prefix",
+                "SELECT COUNT(1) FROM GoodsReceipt WITH (UPDLOCK, HOLDLOCK) WHERE Code LIKE @Prefix",
                 new { Prefix = $"PN-{dateStr}-%" }, transaction);
 
             var receiptCode = $"PN-{dateStr}-{(countToday + 1):D3}";
             var receiptId = Guid.NewGuid();
-            var totalAmount = dto.Items.Sum(x => x.Quantity * x.UnitPrice);
+            var goodsTotal = dto.Items.Sum(x => x.Quantity * x.UnitPrice);
+            var totalQty = dto.Items.Sum(x => x.Quantity);
 
-            var receipt = new GoodsReceipt
-            {
-                Id = receiptId,
-                Code = receiptCode,
-                SupplierId = dto.SupplierId,
-                ReceiptDate = dto.ReceiptDate ?? DateTime.Now,
-                TotalAmount = totalAmount,
-                Status = "COMPLETED",
-                Note = dto.Note,
-                CreatedAt = DateTime.Now,
-                UpdatedAt = DateTime.Now,
-                IsDeleted = false
-            };
-
-            var insertReceiptSql = @"
-                INSERT INTO GoodsReceipt (Id, Code, SupplierId, ReceiptDate, TotalAmount, Status, Note, CreatedAt, UpdatedAt, IsDeleted)
-                VALUES (@Id, @Code, @SupplierId, @ReceiptDate, @TotalAmount, @Status, @Note, @CreatedAt, @UpdatedAt, @IsDeleted)";
-            await connection.ExecuteAsync(insertReceiptSql, receipt, transaction);
+            await connection.ExecuteAsync(@"
+                INSERT INTO GoodsReceipt (Id, Code, SupplierId, ReceiptDate, TotalAmount, ShippingFee, Status, Note, CreatedAt, UpdatedAt, IsDeleted)
+                VALUES (@Id, @Code, @SupplierId, @ReceiptDate, @TotalAmount, @ShippingFee, 'COMPLETED', @Note, GETDATE(), GETDATE(), 0)",
+                new
+                {
+                    Id = receiptId,
+                    Code = receiptCode,
+                    dto.SupplierId,
+                    ReceiptDate = dto.ReceiptDate ?? DateTime.Now,
+                    TotalAmount = goodsTotal + dto.ShippingFee,
+                    dto.ShippingFee,
+                    dto.Note
+                }, transaction);
 
             foreach (var item in dto.Items)
             {
-                var detailId = Guid.NewGuid();
-                var itemTotal = item.Quantity * item.UnitPrice;
+                // Phân bổ phí ship theo giá trị dòng hàng (hàng đắt chịu nhiều hơn); toàn hàng 0đ thì chia theo số lượng
+                var lineValue = item.Quantity * item.UnitPrice;
+                var allocated = goodsTotal > 0 ? dto.ShippingFee * lineValue / goodsTotal : dto.ShippingFee * item.Quantity / totalQty;
+                var landedUnitCost = Math.Round(item.UnitPrice + allocated / item.Quantity, 2);
 
-                var insertDetailSql = @"
-                    INSERT INTO GoodsReceiptDetail (Id, GoodsReceiptId, ProductId, Quantity, UnitPrice, TotalPrice, CreatedAt)
-                    VALUES (@Id, @GoodsReceiptId, @ProductId, @Quantity, @UnitPrice, @TotalPrice, GETDATE())";
-                await connection.ExecuteAsync(insertDetailSql, new
-                {
-                    Id = detailId,
-                    GoodsReceiptId = receiptId,
-                    item.ProductId,
-                    item.Quantity,
-                    item.UnitPrice,
-                    TotalPrice = itemTotal
-                }, transaction);
-
-                // Lấy thông tin sản phẩm hiện tại để cập nhật kho và tính giá vốn bình quân
-                var product = await connection.QueryFirstOrDefaultAsync<Product>(
-                    "SELECT * FROM Product WHERE Id = @Id", new { Id = item.ProductId }, transaction);
-
-                if (product != null)
-                {
-                    var qtyBefore = product.CurrentStock;
-                    var qtyChange = item.Quantity;
-                    var qtyAfter = qtyBefore + qtyChange;
-
-                    // Tính giá vốn bình quân gia quyền: (tồn_cũ * giá_vốn_cũ + nhập_mới * giá_nhập) / tổng_tồn_mới
-                    decimal newCostPrice = product.CostPrice;
-                    if (qtyAfter > 0)
-                    {
-                        var totalVal = (qtyBefore * product.CostPrice) + (qtyChange * item.UnitPrice);
-                        newCostPrice = Math.Round(totalVal / qtyAfter, 2);
-                    }
-
-                    // Cập nhật Product
-                    await connection.ExecuteAsync(@"
-                        UPDATE Product 
-                        SET CurrentStock = @QtyAfter, CostPrice = @NewCostPrice, UpdatedAt = GETDATE()
-                        WHERE Id = @Id",
-                        new { QtyAfter = qtyAfter, NewCostPrice = newCostPrice, Id = product.Id }, transaction);
-
-                    // Ghi thẻ kho StockTransaction (IMPORT)
-                    var stockTransSql = @"
-                        INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-                        VALUES (@Id, @ProductId, 'IMPORT', @ReferenceCode, @QuantityBefore, @QuantityChange, @QuantityAfter, @Note, GETDATE())";
-                    await connection.ExecuteAsync(stockTransSql, new
+                await connection.ExecuteAsync(@"
+                    INSERT INTO GoodsReceiptDetail (Id, GoodsReceiptId, ProductId, Quantity, UnitPrice, TotalPrice, LandedUnitCost, CreatedAt)
+                    VALUES (@Id, @GoodsReceiptId, @ProductId, @Quantity, @UnitPrice, @TotalPrice, @LandedUnitCost, GETDATE())",
+                    new
                     {
                         Id = Guid.NewGuid(),
-                        ProductId = product.Id,
-                        ReferenceCode = receiptCode,
-                        QuantityBefore = qtyBefore,
-                        QuantityChange = qtyChange,
-                        QuantityAfter = qtyAfter,
-                        Note = $"Nhập hàng theo phiếu {receiptCode}"
+                        GoodsReceiptId = receiptId,
+                        item.ProductId,
+                        item.Quantity,
+                        item.UnitPrice,
+                        TotalPrice = lineValue,
+                        LandedUnitCost = landedUnitCost
                     }, transaction);
-                }
+
+                var product = await connection.QueryFirstAsync<Product>(
+                    "SELECT * FROM Product WITH (UPDLOCK) WHERE Id = @Id", new { Id = item.ProductId }, transaction);
+                var qtyBefore = product.CurrentStock;
+                var qtyAfter = qtyBefore + item.Quantity;
+
+                // Giá vốn bình quân gia quyền, tính theo giá đã gồm phí ship:
+                // (tồn cũ × giá vốn cũ + số nhập × giá vốn thực) / tồn mới
+                var newCostPrice = Math.Round((qtyBefore * product.CostPrice + item.Quantity * landedUnitCost) / qtyAfter, 2);
+
+                await connection.ExecuteAsync(
+                    "UPDATE Product SET CurrentStock = @QtyAfter, CostPrice = @NewCostPrice, UpdatedAt = GETDATE() WHERE Id = @Id",
+                    new { QtyAfter = qtyAfter, NewCostPrice = newCostPrice, Id = product.Id }, transaction);
+
+                await InsertStockTransactionAsync(connection, transaction, product.Id, "IMPORT", receiptCode, qtyBefore, item.Quantity, qtyAfter,
+                    $"Nhập hàng theo phiếu {receiptCode}");
             }
 
             transaction.Commit();
@@ -174,9 +160,101 @@ public class GoodsReceiptService : IGoodsReceiptService
         catch (Exception ex)
         {
             transaction.Rollback();
-            return new RestData<GoodsReceiptDto> { IsSuccess = false, Message = $"Lỗi khi tạo phiếu nhập: {ex.Message}" };
+            return Fail($"Lỗi khi tạo phiếu nhập: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// Hủy phiếu nhập nhầm: trừ lại tồn kho, tính ngược giá vốn bình quân, ghi thẻ kho.
+    /// Không hủy được nếu hàng của phiếu đã bán bớt (tồn hiện tại ít hơn số đã nhập).
+    /// </summary>
+    public async Task<RestData<GoodsReceiptDto>> CancelReceiptAsync(Guid id, string? reason)
+    {
+        if ((reason?.Length ?? 0) > 500)
+            return Fail("Lý do hủy tối đa 500 ký tự.");
+
+        using var connection = _connectionFactory.CreateConnection();
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+
+        try
+        {
+            var receipt = await connection.QueryFirstOrDefaultAsync<GoodsReceipt>(
+                "SELECT * FROM GoodsReceipt WITH (UPDLOCK) WHERE Id = @Id AND IsDeleted = 0", new { Id = id }, transaction);
+            if (receipt == null) return Fail("Không tìm thấy phiếu nhập.");
+            if (receipt.Status == "CANCELLED") return Fail("Phiếu nhập này đã được hủy trước đó.");
+
+            var lines = (await connection.QueryAsync<GoodsReceiptDetail>(
+                "SELECT * FROM GoodsReceiptDetail WHERE GoodsReceiptId = @Id", new { Id = id }, transaction)).ToList();
+
+            // Gộp theo sản phẩm (1 phiếu có thể có nhiều dòng cùng sản phẩm)
+            var perProduct = lines.GroupBy(l => l.ProductId).Select(g => new
+            {
+                ProductId = g.Key,
+                Quantity = g.Sum(x => x.Quantity),
+                Value = g.Sum(x => x.Quantity * (x.LandedUnitCost ?? x.UnitPrice))
+            }).ToList();
+
+            var products = (await connection.QueryAsync<Product>(
+                "SELECT * FROM Product WITH (UPDLOCK) WHERE Id IN @Ids", new { Ids = perProduct.Select(p => p.ProductId).ToList() }, transaction))
+                .ToDictionary(p => p.Id);
+
+            var shortages = perProduct
+                .Where(p => !products.ContainsKey(p.ProductId) || products[p.ProductId].CurrentStock < p.Quantity)
+                .Select(p => products.TryGetValue(p.ProductId, out var pr)
+                    ? $"\"{pr.Name}\" chỉ còn {pr.CurrentStock}/{p.Quantity} chiếc"
+                    : "một sản phẩm đã bị xóa")
+                .ToList();
+            if (shortages.Count > 0)
+                return Fail($"Không hủy được vì hàng của phiếu đã bán bớt: {string.Join("; ", shortages)}. " +
+                            "Hãy dùng phiếu nhập mới để điều chỉnh phần chênh lệch.");
+
+            foreach (var p in perProduct)
+            {
+                var product = products[p.ProductId];
+                var qtyBefore = product.CurrentStock;
+                var qtyAfter = qtyBefore - p.Quantity;
+
+                // Tính ngược bình quân gia quyền: bỏ phần giá trị của phiếu bị hủy ra khỏi tồn kho
+                var newCostPrice = product.CostPrice;
+                if (qtyAfter > 0)
+                {
+                    var remaining = (qtyBefore * product.CostPrice - p.Value) / qtyAfter;
+                    if (remaining > 0) newCostPrice = Math.Round(remaining, 2);
+                }
+
+                await connection.ExecuteAsync(
+                    "UPDATE Product SET CurrentStock = @QtyAfter, CostPrice = @NewCostPrice, UpdatedAt = GETDATE() WHERE Id = @Id",
+                    new { QtyAfter = qtyAfter, NewCostPrice = newCostPrice, Id = product.Id }, transaction);
+
+                await InsertStockTransactionAsync(connection, transaction, product.Id, "IMPORT_CANCEL", receipt.Code, qtyBefore, -p.Quantity, qtyAfter,
+                    $"Hủy phiếu nhập {receipt.Code}" + (string.IsNullOrWhiteSpace(reason) ? "" : $": {reason.Trim()}"));
+            }
+
+            await connection.ExecuteAsync(@"
+                UPDATE GoodsReceipt SET Status = 'CANCELLED', CancelledAt = GETDATE(), CancelReason = @Reason, UpdatedAt = GETDATE()
+                WHERE Id = @Id", new { Id = id, Reason = string.IsNullOrWhiteSpace(reason) ? null : reason.Trim() }, transaction);
+
+            transaction.Commit();
+            var result = await GetByIdAsync(id);
+            result.Message = $"Đã hủy phiếu {receipt.Code} và trừ lại tồn kho.";
+            return result;
+        }
+        catch (Exception ex)
+        {
+            transaction.Rollback();
+            return Fail($"Lỗi khi hủy phiếu nhập: {ex.Message}");
+        }
+    }
+
+    private static Task InsertStockTransactionAsync(IDbConnection connection, IDbTransaction transaction, Guid productId,
+        string type, string reference, int before, int change, int after, string note) =>
+        connection.ExecuteAsync(@"
+            INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
+            VALUES (NEWID(), @ProductId, @Type, @Reference, @Before, @Change, @After, @Note, GETDATE())",
+            new { ProductId = productId, Type = type, Reference = reference, Before = before, Change = change, After = after, Note = note }, transaction);
+
+    private static RestData<GoodsReceiptDto> Fail(string message) => new() { IsSuccess = false, Message = message };
 
     public async Task<RestData<List<SupplierDto>>> GetSuppliersAsync()
     {

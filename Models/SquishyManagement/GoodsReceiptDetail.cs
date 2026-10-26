@@ -14,5 +14,6 @@ public class GoodsReceiptDetail
     public int Quantity { get; set; }
     public decimal UnitPrice { get; set; }
     public decimal TotalPrice { get; set; }
+    public decimal? LandedUnitCost { get; set; }    // giá nhập + phí ship phân bổ cho 1 chiếc
     public DateTime CreatedAt { get; set; } = DateTime.Now;
 }

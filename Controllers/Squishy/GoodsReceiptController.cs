@@ -40,6 +40,14 @@ public class GoodsReceiptController : ControllerBase
         return Ok(result);
     }
 
+    [HttpPost("{id}/cancel")]
+    public async Task<IActionResult> Cancel(Guid id, [FromBody] CancelGoodsReceiptDto dto)
+    {
+        var result = await _goodsReceiptService.CancelReceiptAsync(id, dto?.Reason);
+        if (!result.IsSuccess) return BadRequest(result);
+        return Ok(result);
+    }
+
     [HttpGet("suppliers")]
     public async Task<IActionResult> GetSuppliers()
     {

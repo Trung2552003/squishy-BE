@@ -1,4 +1,6 @@
 using System;
+using System.Data;
+using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -266,37 +268,8 @@ public class ProductService : IProductService
                     VALUES (@Id, @CategoryId, @Sku, @Name, @Description, @Unit, @CostPrice, @SalePrice, @CurrentStock, @MinStockAlert, @SquishyType, @MainImageUrl, @IsActive, @CreatedAt, @UpdatedAt, @IsDeleted)";
         await connection.ExecuteAsync(sql, product);
 
-        // Lưu ảnh nếu có
-        if (dto.ImageUrls != null && dto.ImageUrls.Any())
-        {
-            int order = 1;
-            foreach (var url in dto.ImageUrls)
-            {
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    await connection.ExecuteAsync(
-                        @"INSERT INTO MediaImage (Id, EntityId, EntityType, Url, IsPrimary, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
-                          VALUES (@Id, @EntityId, 'PRODUCT', @Url, @IsPrimary, @DisplayOrder, GETDATE(), GETDATE(), 0)",
-                        new { Id = Guid.NewGuid(), EntityId = product.Id, Url = url, IsPrimary = (order == 1), DisplayOrder = order++ });
-                }
-            }
-        }
-
-        // Lưu video nếu có
-        if (dto.VideoUrls != null && dto.VideoUrls.Any())
-        {
-            int order = 1;
-            foreach (var url in dto.VideoUrls)
-            {
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    await connection.ExecuteAsync(
-                        @"INSERT INTO MediaVideo (Id, EntityId, EntityType, Url, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
-                          VALUES (@Id, @EntityId, 'PRODUCT', @Url, @DisplayOrder, GETDATE(), GETDATE(), 0)",
-                        new { Id = Guid.NewGuid(), EntityId = product.Id, Url = url, DisplayOrder = order++ });
-                }
-            }
-        }
+        // Gắn ảnh/video đã tải lên vào sản phẩm (không tạo bản ghi mới để tránh trùng trong thư viện)
+        await SyncProductMediaAsync(connection, product.Id, dto.ImageUrls, dto.VideoUrls);
 
         return await GetByIdAsync(product.Id);
     }
@@ -337,37 +310,7 @@ public class ProductService : IProductService
             return new RestData<ProductDto> { IsSuccess = false, Message = "Không tìm thấy sản phẩm." };
 
         // Cập nhật lại media nếu truyền vào danh sách
-        if (dto.ImageUrls != null)
-        {
-            await connection.ExecuteAsync("UPDATE MediaImage SET IsDeleted = 1 WHERE EntityId = @Id AND EntityType = 'PRODUCT'", new { Id = id });
-            int order = 1;
-            foreach (var url in dto.ImageUrls)
-            {
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    await connection.ExecuteAsync(
-                        @"INSERT INTO MediaImage (Id, EntityId, EntityType, Url, IsPrimary, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
-                          VALUES (@Id, @EntityId, 'PRODUCT', @Url, @IsPrimary, @DisplayOrder, GETDATE(), GETDATE(), 0)",
-                        new { Id = Guid.NewGuid(), EntityId = id, Url = url, IsPrimary = (order == 1), DisplayOrder = order++ });
-                }
-            }
-        }
-
-        if (dto.VideoUrls != null)
-        {
-            await connection.ExecuteAsync("UPDATE MediaVideo SET IsDeleted = 1 WHERE EntityId = @Id AND EntityType = 'PRODUCT'", new { Id = id });
-            int order = 1;
-            foreach (var url in dto.VideoUrls)
-            {
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    await connection.ExecuteAsync(
-                        @"INSERT INTO MediaVideo (Id, EntityId, EntityType, Url, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
-                          VALUES (@Id, @EntityId, 'PRODUCT', @Url, @DisplayOrder, GETDATE(), GETDATE(), 0)",
-                        new { Id = Guid.NewGuid(), EntityId = id, Url = url, DisplayOrder = order++ });
-                }
-            }
-        }
+        await SyncProductMediaAsync(connection, id, dto.ImageUrls, dto.VideoUrls);
 
         return await GetByIdAsync(id);
     }
@@ -377,5 +320,61 @@ public class ProductService : IProductService
         using var connection = _connectionFactory.CreateConnection();
         await connection.ExecuteAsync("UPDATE Product SET IsDeleted = 1, UpdatedAt = GETDATE() WHERE Id = @Id", new { Id = id });
         return new RestData<bool> { IsSuccess = true, Data = true, Message = "Xóa sản phẩm thành công." };
+    }
+
+    /// <summary>
+    /// Đồng bộ ảnh/video của sản phẩm theo danh sách URL (thứ tự = thứ tự hiển thị, ảnh đầu là ảnh chính).
+    /// Ảnh tải lên từ form đã có sẵn 1 bản ghi trong thư viện: gắn lại chính bản ghi đó thay vì thêm bản mới,
+    /// nên thư viện không bị nhân đôi. Ảnh không còn trong danh sách thì gỡ khỏi sản phẩm.
+    /// null = không đổi media (giữ nguyên).
+    /// </summary>
+    private static async Task SyncProductMediaAsync(IDbConnection connection, Guid productId, List<string>? imageUrls, List<string>? videoUrls)
+    {
+        if (imageUrls != null)
+            await SyncMediaTableAsync(connection, "MediaImage", productId, imageUrls, withPrimary: true);
+        if (videoUrls != null)
+            await SyncMediaTableAsync(connection, "MediaVideo", productId, videoUrls, withPrimary: false);
+    }
+
+    private static async Task SyncMediaTableAsync(IDbConnection connection, string table, Guid productId, List<string> urls, bool withPrimary)
+    {
+        var list = urls.Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim()).Distinct().ToList();
+
+        // Gỡ những ảnh không còn trong danh sách
+        await connection.ExecuteAsync(
+            $"UPDATE {table} SET IsDeleted = 1, UpdatedAt = GETDATE() WHERE EntityId = @Id AND EntityType = 'PRODUCT' AND IsDeleted = 0" +
+            (list.Count > 0 ? " AND Url NOT IN @Urls" : ""),
+            new { Id = productId, Urls = list });
+
+        var order = 1;
+        foreach (var url in list)
+        {
+            var primarySet = withPrimary ? ", IsPrimary = @IsPrimary" : "";
+            // Ưu tiên bản ghi đang gắn sản phẩm này, sau đó tới ảnh vừa tải lên chưa gắn vào đâu
+            var existingId = await connection.ExecuteScalarAsync<Guid?>($@"
+                SELECT TOP 1 Id FROM {table}
+                WHERE Url = @Url AND EntityType = 'PRODUCT' AND IsDeleted = 0 AND (EntityId = @Id OR EntityId IS NULL)
+                ORDER BY CASE WHEN EntityId = @Id THEN 0 ELSE 1 END, CreatedAt",
+                new { Url = url, Id = productId });
+
+            if (existingId.HasValue)
+            {
+                await connection.ExecuteAsync(
+                    $"UPDATE {table} SET EntityId = @Id, DisplayOrder = @Order{primarySet}, UpdatedAt = GETDATE() WHERE Id = @MediaId",
+                    new { Id = productId, Order = order, IsPrimary = order == 1, MediaId = existingId.Value });
+            }
+            else
+            {
+                // URL nhập tay / ảnh cũ không có bản ghi: tạo mới, lấy tên file từ đường dẫn
+                var fileName = Path.GetFileName(url.Split('?')[0]);
+                await connection.ExecuteAsync(withPrimary
+                    ? @"INSERT INTO MediaImage (Id, EntityId, EntityType, Url, FileName, IsPrimary, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
+                        VALUES (NEWID(), @Id, 'PRODUCT', @Url, @FileName, @IsPrimary, @Order, GETDATE(), GETDATE(), 0)"
+                    : @"INSERT INTO MediaVideo (Id, EntityId, EntityType, Url, FileName, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
+                        VALUES (NEWID(), @Id, 'PRODUCT', @Url, @FileName, @Order, GETDATE(), GETDATE(), 0)",
+                    new { Id = productId, Url = url, FileName = fileName, IsPrimary = order == 1, Order = order });
+            }
+            order++;
+        }
     }
 }
