@@ -105,10 +105,14 @@ if (!Directory.Exists(uploadsPath))
     Directory.CreateDirectory(uploadsPath);
 }
 
+// /uploads/...?w=320 → ảnh thu nhỏ (đặt trước static files)
+app.UseMiddleware<ThumbnailMiddleware>(uploadsPath);
 app.UseStaticFiles(new StaticFileOptions
 {
     FileProvider = new PhysicalFileProvider(uploadsPath),
-    RequestPath = "/uploads"
+    RequestPath = "/uploads",
+    // Tên file tải lên là duy nhất, không bị ghi đè → cho trình duyệt cache lâu
+    OnPrepareResponse = ctx => ctx.Context.Response.Headers.CacheControl = "public, max-age=604800"
 });
 app.UseCors("AllowFrontend");
 app.UseAuthentication();
