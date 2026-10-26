@@ -248,28 +248,8 @@ public class PaymentService : IPaymentService
                     "SELECT * FROM OrderDetail WHERE OrderId = @OrderId", new { OrderId = order.Id }, transaction);
                 foreach (var item in details)
                 {
-                    var product = await connection.QueryFirstOrDefaultAsync<Product>(
-                        "SELECT * FROM Product WITH (UPDLOCK) WHERE Id = @Id", new { Id = item.ProductId }, transaction);
-                    if (product == null) continue;
-
-                    var qtyBefore = product.CurrentStock;
-                    var qtyAfter = Math.Max(0, qtyBefore - item.Quantity);
-                    await connection.ExecuteAsync(
-                        "UPDATE Product SET CurrentStock = @QtyAfter, UpdatedAt = GETDATE() WHERE Id = @Id",
-                        new { QtyAfter = qtyAfter, Id = product.Id }, transaction);
-                    await connection.ExecuteAsync(@"
-                        INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-                        VALUES (@Id, @ProductId, 'EXPORT', @ReferenceCode, @QuantityBefore, -@QuantityChange, @QuantityAfter, @Note, GETDATE())",
-                        new
-                        {
-                            Id = Guid.NewGuid(),
-                            ProductId = product.Id,
-                            ReferenceCode = order.OrderCode,
-                            QuantityBefore = qtyBefore,
-                            QuantityChange = item.Quantity,
-                            QuantityAfter = qtyAfter,
-                            Note = $"Xuất bán đơn hàng {order.OrderCode} qua SePay"
-                        }, transaction);
+                    await Inventory.ChangeAsync(connection, transaction, item.ProductId, item.VariantId, -item.Quantity, "EXPORT", order.OrderCode,
+                        $"Xuất bán đơn hàng {order.OrderCode} qua SePay");
                 }
 
                 transaction.Commit();

@@ -59,9 +59,10 @@ public class GoodsReceiptService : IGoodsReceiptService
             return new RestData<GoodsReceiptDto> { IsSuccess = false, Message = "Không tìm thấy phiếu nhập." };
 
         var detailSql = @"
-            SELECT d.*, p.Name AS ProductName, p.Sku
+            SELECT d.*, p.Name + ISNULL(' - ' + v.Name, '') AS ProductName, v.Name AS VariantName, p.Sku
             FROM GoodsReceiptDetail d
             INNER JOIN Product p ON d.ProductId = p.Id
+            LEFT JOIN ProductVariant v ON v.Id = d.VariantId
             WHERE d.GoodsReceiptId = @Id";
 
         var details = (await connection.QueryAsync<GoodsReceiptItemDto>(detailSql, new { Id = id })).ToList();
@@ -85,11 +86,17 @@ public class GoodsReceiptService : IGoodsReceiptService
 
         try
         {
-            var productIds = dto.Items.Select(i => i.ProductId).Distinct().ToList();
-            var existing = await connection.ExecuteScalarAsync<int>(
-                "SELECT COUNT(1) FROM Product WHERE Id IN @Ids AND IsDeleted = 0", new { Ids = productIds }, transaction);
-            if (existing != productIds.Count)
-                return Fail("Có sản phẩm không còn tồn tại. Vui lòng tải lại trang.");
+            foreach (var item in dto.Items)
+            {
+                var name = await connection.QueryFirstOrDefaultAsync<string?>(
+                    "SELECT Name FROM Product WHERE Id = @Id AND IsDeleted = 0", new { Id = item.ProductId }, transaction);
+                if (name == null)
+                    return Fail("Có sản phẩm không còn tồn tại. Vui lòng tải lại trang.");
+                // Sản phẩm có màu thì phải nhập theo từng màu (cho phép nhập cả màu đang tạm ngừng bán)
+                var variantError = await Inventory.ValidateVariantAsync(connection, transaction, item.ProductId, item.VariantId, name, requireActive: false);
+                if (variantError != null)
+                    return Fail(variantError);
+            }
 
             // Sinh mã phiếu nhập PN-yyyyMMdd-###
             var dateStr = DateTime.Now.ToString("yyyyMMdd");
@@ -124,34 +131,23 @@ public class GoodsReceiptService : IGoodsReceiptService
                 var landedUnitCost = Math.Round(item.UnitPrice + allocated / item.Quantity, 2);
 
                 await connection.ExecuteAsync(@"
-                    INSERT INTO GoodsReceiptDetail (Id, GoodsReceiptId, ProductId, Quantity, UnitPrice, TotalPrice, LandedUnitCost, CreatedAt)
-                    VALUES (@Id, @GoodsReceiptId, @ProductId, @Quantity, @UnitPrice, @TotalPrice, @LandedUnitCost, GETDATE())",
+                    INSERT INTO GoodsReceiptDetail (Id, GoodsReceiptId, ProductId, VariantId, Quantity, UnitPrice, TotalPrice, LandedUnitCost, CreatedAt)
+                    VALUES (@Id, @GoodsReceiptId, @ProductId, @VariantId, @Quantity, @UnitPrice, @TotalPrice, @LandedUnitCost, GETDATE())",
                     new
                     {
                         Id = Guid.NewGuid(),
                         GoodsReceiptId = receiptId,
                         item.ProductId,
+                        item.VariantId,
                         item.Quantity,
                         item.UnitPrice,
                         TotalPrice = lineValue,
                         LandedUnitCost = landedUnitCost
                     }, transaction);
 
-                var product = await connection.QueryFirstAsync<Product>(
-                    "SELECT * FROM Product WITH (UPDLOCK) WHERE Id = @Id", new { Id = item.ProductId }, transaction);
-                var qtyBefore = product.CurrentStock;
-                var qtyAfter = qtyBefore + item.Quantity;
-
-                // Giá vốn bình quân gia quyền, tính theo giá đã gồm phí ship:
-                // (tồn cũ × giá vốn cũ + số nhập × giá vốn thực) / tồn mới
-                var newCostPrice = Math.Round((qtyBefore * product.CostPrice + item.Quantity * landedUnitCost) / qtyAfter, 2);
-
-                await connection.ExecuteAsync(
-                    "UPDATE Product SET CurrentStock = @QtyAfter, CostPrice = @NewCostPrice, UpdatedAt = GETDATE() WHERE Id = @Id",
-                    new { QtyAfter = qtyAfter, NewCostPrice = newCostPrice, Id = product.Id }, transaction);
-
-                await InsertStockTransactionAsync(connection, transaction, product.Id, "IMPORT", receiptCode, qtyBefore, item.Quantity, qtyAfter,
-                    $"Nhập hàng theo phiếu {receiptCode}");
+                // Cộng kho, giá vốn bình quân gia quyền theo giá đã gồm phí ship (tính riêng cho từng màu)
+                await Inventory.ChangeAsync(connection, transaction, item.ProductId, item.VariantId, item.Quantity, "IMPORT", receiptCode,
+                    $"Nhập hàng theo phiếu {receiptCode}", Inventory.CostMode.Import, landedUnitCost);
             }
 
             transaction.Commit();
@@ -187,48 +183,37 @@ public class GoodsReceiptService : IGoodsReceiptService
             var lines = (await connection.QueryAsync<GoodsReceiptDetail>(
                 "SELECT * FROM GoodsReceiptDetail WHERE GoodsReceiptId = @Id", new { Id = id }, transaction)).ToList();
 
-            // Gộp theo sản phẩm (1 phiếu có thể có nhiều dòng cùng sản phẩm)
-            var perProduct = lines.GroupBy(l => l.ProductId).Select(g => new
+            // Gộp theo sản phẩm + màu (1 phiếu có thể có nhiều dòng cùng loại)
+            var perLine = lines.GroupBy(l => new { l.ProductId, l.VariantId }).Select(g => new
             {
-                ProductId = g.Key,
+                g.Key.ProductId,
+                g.Key.VariantId,
                 Quantity = g.Sum(x => x.Quantity),
                 Value = g.Sum(x => x.Quantity * (x.LandedUnitCost ?? x.UnitPrice))
             }).ToList();
 
-            var products = (await connection.QueryAsync<Product>(
-                "SELECT * FROM Product WITH (UPDLOCK) WHERE Id IN @Ids", new { Ids = perProduct.Select(p => p.ProductId).ToList() }, transaction))
-                .ToDictionary(p => p.Id);
-
-            var shortages = perProduct
-                .Where(p => !products.ContainsKey(p.ProductId) || products[p.ProductId].CurrentStock < p.Quantity)
-                .Select(p => products.TryGetValue(p.ProductId, out var pr)
-                    ? $"\"{pr.Name}\" chỉ còn {pr.CurrentStock}/{p.Quantity} chiếc"
-                    : "một sản phẩm đã bị xóa")
-                .ToList();
+            var shortages = new List<string>();
+            foreach (var l in perLine)
+            {
+                var stock = await Inventory.GetStockAsync(connection, transaction, l.ProductId, l.VariantId);
+                if (stock < l.Quantity)
+                {
+                    var name = await connection.QueryFirstOrDefaultAsync<string?>(@"
+                        SELECT p.Name + ISNULL(' - ' + v.Name, '') FROM Product p LEFT JOIN ProductVariant v ON v.Id = @VariantId WHERE p.Id = @Id",
+                        new { Id = l.ProductId, l.VariantId }, transaction) ?? "Sản phẩm đã xóa";
+                    shortages.Add($"\"{name}\" chỉ còn {stock}/{l.Quantity} chiếc");
+                }
+            }
             if (shortages.Count > 0)
                 return Fail($"Không hủy được vì hàng của phiếu đã bán bớt: {string.Join("; ", shortages)}. " +
                             "Hãy dùng phiếu nhập mới để điều chỉnh phần chênh lệch.");
 
-            foreach (var p in perProduct)
+            foreach (var l in perLine)
             {
-                var product = products[p.ProductId];
-                var qtyBefore = product.CurrentStock;
-                var qtyAfter = qtyBefore - p.Quantity;
-
-                // Tính ngược bình quân gia quyền: bỏ phần giá trị của phiếu bị hủy ra khỏi tồn kho
-                var newCostPrice = product.CostPrice;
-                if (qtyAfter > 0)
-                {
-                    var remaining = (qtyBefore * product.CostPrice - p.Value) / qtyAfter;
-                    if (remaining > 0) newCostPrice = Math.Round(remaining, 2);
-                }
-
-                await connection.ExecuteAsync(
-                    "UPDATE Product SET CurrentStock = @QtyAfter, CostPrice = @NewCostPrice, UpdatedAt = GETDATE() WHERE Id = @Id",
-                    new { QtyAfter = qtyAfter, NewCostPrice = newCostPrice, Id = product.Id }, transaction);
-
-                await InsertStockTransactionAsync(connection, transaction, product.Id, "IMPORT_CANCEL", receipt.Code, qtyBefore, -p.Quantity, qtyAfter,
-                    $"Hủy phiếu nhập {receipt.Code}" + (string.IsNullOrWhiteSpace(reason) ? "" : $": {reason.Trim()}"));
+                // Trừ lại kho và bỏ giá trị lô nhập ra khỏi giá vốn bình quân
+                await Inventory.ChangeAsync(connection, transaction, l.ProductId, l.VariantId, -l.Quantity, "IMPORT_CANCEL", receipt.Code,
+                    $"Hủy phiếu nhập {receipt.Code}" + (string.IsNullOrWhiteSpace(reason) ? "" : $": {reason.Trim()}"),
+                    Inventory.CostMode.CancelImport, l.Value);
             }
 
             await connection.ExecuteAsync(@"
@@ -246,13 +231,6 @@ public class GoodsReceiptService : IGoodsReceiptService
             return Fail($"Lỗi khi hủy phiếu nhập: {ex.Message}");
         }
     }
-
-    private static Task InsertStockTransactionAsync(IDbConnection connection, IDbTransaction transaction, Guid productId,
-        string type, string reference, int before, int change, int after, string note) =>
-        connection.ExecuteAsync(@"
-            INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-            VALUES (NEWID(), @ProductId, @Type, @Reference, @Before, @Change, @After, @Note, GETDATE())",
-            new { ProductId = productId, Type = type, Reference = reference, Before = before, Change = change, After = after, Note = note }, transaction);
 
     private static RestData<GoodsReceiptDto> Fail(string message) => new() { IsSuccess = false, Message = message };
 
@@ -304,9 +282,10 @@ public class GoodsReceiptService : IGoodsReceiptService
         }
 
         var sql = $@"
-            SELECT st.*, p.Name AS ProductName, p.Sku
+            SELECT st.*, p.Name + ISNULL(' - ' + v.Name, '') AS ProductName, p.Sku
             FROM StockTransaction st
             INNER JOIN Product p ON st.ProductId = p.Id
+            LEFT JOIN ProductVariant v ON v.Id = st.VariantId
             WHERE {whereClause}
             ORDER BY st.CreatedAt DESC";
 

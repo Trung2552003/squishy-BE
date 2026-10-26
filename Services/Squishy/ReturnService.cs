@@ -87,9 +87,10 @@ public class ReturnService : IReturnService
             return new RestData<ReturnRequestDto> { IsSuccess = false, Message = "Không tìm thấy phiếu đổi trả." };
 
         dto.Items = (await connection.QueryAsync<ReturnItemDto>(@"
-            SELECT i.*, p.MainImageUrl
+            SELECT i.*, COALESCE(v.ImageUrl, p.MainImageUrl) AS MainImageUrl
             FROM ReturnRequestItem i
             LEFT JOIN Product p ON i.ProductId = p.Id
+            LEFT JOIN ProductVariant v ON v.Id = i.VariantId
             WHERE i.ReturnRequestId = @Id", new { Id = id })).ToList();
         dto.TotalQuantity = dto.Items.Sum(i => i.Quantity);
 
@@ -197,6 +198,7 @@ public class ReturnService : IReturnService
                     ReturnRequestId = requestId,
                     OrderDetailId = detail.OrderDetailId,
                     ProductId = detail.ProductId,
+                    VariantId = detail.VariantId,
                     ProductName = detail.ProductName,
                     Quantity = line.Quantity,
                     UnitPrice = detail.UnitPrice,
@@ -213,12 +215,20 @@ public class ReturnService : IReturnService
                     if (exchangeProduct == null)
                         return Fail("Sản phẩm đổi không tồn tại.");
 
+                    // Đổi cùng mẫu mà không chọn màu khác thì mặc định giao lại đúng màu đã mua
+                    var exchangeVariantId = line.ExchangeVariantId ?? (exchangeProduct.Id == detail.ProductId ? detail.VariantId : null);
+                    var variantError = await Inventory.ValidateVariantAsync(connection, transaction, exchangeProduct.Id, exchangeVariantId, exchangeProduct.Name, requireActive: true);
+                    if (variantError != null)
+                        return Fail(variantError);
+                    var exchangeVariantName = await Inventory.GetVariantNameAsync(connection, transaction, exchangeVariantId);
+
                     item.ExchangeProductId = exchangeProduct.Id;
-                    item.ExchangeProductName = exchangeProduct.Name;
+                    item.ExchangeVariantId = exchangeVariantId;
+                    item.ExchangeProductName = exchangeVariantName == null ? exchangeProduct.Name : $"{exchangeProduct.Name} - {exchangeVariantName}";
                     item.ExchangeQuantity = line.ExchangeQuantity > 0 ? line.ExchangeQuantity : line.Quantity;
                     // Đổi cùng mẫu thì giữ giá khách đã mua, đổi mẫu khác thì theo giá bán hiện tại
                     item.ExchangeUnitPrice = exchangeProduct.Id == detail.ProductId ? detail.UnitPrice : exchangeProduct.SalePrice;
-                    item.ExchangeCostPrice = exchangeProduct.CostPrice;
+                    item.ExchangeCostPrice = await Inventory.GetCostAsync(connection, transaction, exchangeProduct.Id, exchangeVariantId);
                 }
 
                 itemsToInsert.Add(item);
@@ -273,10 +283,10 @@ public class ReturnService : IReturnService
                 entity, transaction);
 
             await connection.ExecuteAsync(@"
-                INSERT INTO ReturnRequestItem (Id, ReturnRequestId, OrderDetailId, ProductId, ProductName, Quantity, UnitPrice, CostPrice, ItemCondition,
-                                               ExchangeProductId, ExchangeProductName, ExchangeQuantity, ExchangeUnitPrice, ExchangeCostPrice)
-                VALUES (@Id, @ReturnRequestId, @OrderDetailId, @ProductId, @ProductName, @Quantity, @UnitPrice, @CostPrice, @ItemCondition,
-                        @ExchangeProductId, @ExchangeProductName, @ExchangeQuantity, @ExchangeUnitPrice, @ExchangeCostPrice)",
+                INSERT INTO ReturnRequestItem (Id, ReturnRequestId, OrderDetailId, ProductId, VariantId, ProductName, Quantity, UnitPrice, CostPrice, ItemCondition,
+                                               ExchangeProductId, ExchangeVariantId, ExchangeProductName, ExchangeQuantity, ExchangeUnitPrice, ExchangeCostPrice)
+                VALUES (@Id, @ReturnRequestId, @OrderDetailId, @ProductId, @VariantId, @ProductName, @Quantity, @UnitPrice, @CostPrice, @ItemCondition,
+                        @ExchangeProductId, @ExchangeVariantId, @ExchangeProductName, @ExchangeQuantity, @ExchangeUnitPrice, @ExchangeCostPrice)",
                 itemsToInsert, transaction);
 
             transaction.Commit();
@@ -391,44 +401,31 @@ public class ReturnService : IReturnService
 
         foreach (var item in items)
         {
-            var product = await connection.QueryFirstOrDefaultAsync<Product>(
-                "SELECT * FROM Product WITH (UPDLOCK) WHERE Id = @Id", new { Id = item.ProductId }, transaction);
-            if (product == null) continue;
-
             if (item.ItemCondition == "GOOD" && stockWasDeducted)
             {
-                await ChangeStockAsync(connection, transaction, product, item.Quantity, "RETURN_IN", reference,
+                await Inventory.ChangeAsync(connection, transaction, item.ProductId, item.VariantId, item.Quantity, "RETURN_IN", reference,
                     $"Nhập lại kho hàng khách trả (đơn {order.OrderCode})");
                 entity.StockRestored = true;
             }
             else if (item.ItemCondition == "DEFECTIVE" && stockWasDeducted)
             {
                 // Hàng lỗi không quay lại kho bán, chỉ ghi nhận vào thẻ kho để theo dõi
-                await connection.ExecuteAsync(@"
-                    INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-                    VALUES (NEWID(), @ProductId, 'DEFECTIVE', @ReferenceCode, @Qty, 0, @Qty, @Note, GETDATE())",
-                    new
-                    {
-                        ProductId = product.Id,
-                        ReferenceCode = reference,
-                        Qty = product.CurrentStock,
-                        Note = $"Nhận {item.Quantity} hàng lỗi khách trả (đơn {order.OrderCode}) - không nhập lại kho"
-                    }, transaction);
+                await Inventory.LogAsync(connection, transaction, item.ProductId, item.VariantId, "DEFECTIVE", reference,
+                    $"Nhận {item.Quantity} hàng lỗi khách trả (đơn {order.OrderCode}) - không nhập lại kho");
             }
 
             if (entity.RequestType == "EXCHANGE" && item.ExchangeProductId.HasValue && item.ExchangeQuantity > 0)
             {
-                var exchangeProduct = item.ExchangeProductId == product.Id
-                    ? await connection.QueryFirstAsync<Product>("SELECT * FROM Product WHERE Id = @Id", new { Id = product.Id }, transaction)
-                    : await connection.QueryFirstOrDefaultAsync<Product>(
-                        "SELECT * FROM Product WITH (UPDLOCK) WHERE Id = @Id", new { Id = item.ExchangeProductId }, transaction);
-                if (exchangeProduct == null)
+                var exists = await connection.ExecuteScalarAsync<int>(
+                    "SELECT COUNT(1) FROM Product WHERE Id = @Id AND IsDeleted = 0", new { Id = item.ExchangeProductId }, transaction);
+                if (exists == 0)
                     return $"Sản phẩm đổi \"{item.ExchangeProductName}\" không còn tồn tại.";
-                if (exchangeProduct.CurrentStock < item.ExchangeQuantity)
-                    return $"Không đủ hàng để đổi: \"{exchangeProduct.Name}\" chỉ còn {exchangeProduct.CurrentStock} sản phẩm.";
+                var stock = await Inventory.GetStockAsync(connection, transaction, item.ExchangeProductId.Value, item.ExchangeVariantId);
+                if (stock < item.ExchangeQuantity)
+                    return $"Không đủ hàng để đổi: \"{item.ExchangeProductName}\" chỉ còn {stock} sản phẩm.";
 
-                await ChangeStockAsync(connection, transaction, exchangeProduct, -item.ExchangeQuantity, "EXCHANGE_OUT", reference,
-                    $"Xuất hàng đổi cho khách (đơn {order.OrderCode})");
+                await Inventory.ChangeAsync(connection, transaction, item.ExchangeProductId.Value, item.ExchangeVariantId, -item.ExchangeQuantity,
+                    "EXCHANGE_OUT", reference, $"Xuất hàng đổi cho khách (đơn {order.OrderCode})");
             }
         }
 
@@ -459,21 +456,6 @@ public class ReturnService : IReturnService
         return null;
     }
 
-    private static async Task ChangeStockAsync(IDbConnection connection, IDbTransaction transaction, Product product, int change,
-        string type, string reference, string note)
-    {
-        var before = product.CurrentStock;
-        var after = Math.Max(0, before + change);
-        await connection.ExecuteAsync("UPDATE Product SET CurrentStock = @After, UpdatedAt = GETDATE() WHERE Id = @Id",
-            new { After = after, product.Id }, transaction);
-        await connection.ExecuteAsync(@"
-            INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-            VALUES (NEWID(), @ProductId, @Type, @ReferenceCode, @Before, @Change, @After, @Note, GETDATE())",
-            new { ProductId = product.Id, Type = type, ReferenceCode = reference, Before = before, Change = change, After = after, Note = note },
-            transaction);
-        product.CurrentStock = after;
-    }
-
     /// <summary>
     /// Các món trong đơn kèm số lượng đã đổi trả (phiếu chưa bị từ chối, không tính bảo hành).
     /// </summary>
@@ -481,7 +463,7 @@ public class ReturnService : IReturnService
         Guid orderId, Guid? excludeRequestId)
     {
         var items = (await connection.QueryAsync<ReturnableOrderItemDto>(@"
-            SELECT d.Id AS OrderDetailId, d.ProductId, d.ProductName, p.MainImageUrl, d.Quantity, d.UnitPrice,
+            SELECT d.Id AS OrderDetailId, d.ProductId, d.VariantId, d.ProductName, COALESCE(v.ImageUrl, p.MainImageUrl) AS MainImageUrl, d.Quantity, d.UnitPrice,
                    ISNULL((
                        SELECT SUM(ri.Quantity)
                        FROM ReturnRequestItem ri
@@ -491,6 +473,7 @@ public class ReturnService : IReturnService
                    ), 0) AS ReturnedQuantity
             FROM OrderDetail d
             LEFT JOIN Product p ON d.ProductId = p.Id
+            LEFT JOIN ProductVariant v ON v.Id = d.VariantId
             WHERE d.OrderId = @OrderId
             ORDER BY d.CreatedAt", new { OrderId = orderId, ExcludeId = excludeRequestId }, transaction)).ToList();
 

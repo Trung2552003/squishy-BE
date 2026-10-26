@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.IO;
+using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -112,6 +113,8 @@ public class ProductService : IProductService
             }
         }
 
+        await LoadVariantsAsync(connection, products);
+
         var result = new PagedResult<ProductDto>
         {
             Items = products,
@@ -184,6 +187,7 @@ public class ProductService : IProductService
             }
         }
 
+        await LoadVariantsAsync(connection, list);
         return new RestData<List<ProductDto>> { IsSuccess = true, Data = list };
     }
 
@@ -233,6 +237,7 @@ public class ProductService : IProductService
             CreatedAt = vid.CreatedAt
         }).ToList();
 
+        await LoadVariantsAsync(connection, new[] { product });
         return new RestData<ProductDto> { IsSuccess = true, Data = product };
     }
 
@@ -244,6 +249,7 @@ public class ProductService : IProductService
         if (exists > 0)
             return new RestData<ProductDto> { IsSuccess = false, Message = $"Mã SKU '{dto.Sku}' đã tồn tại." };
 
+        var hasVariants = dto.Variants != null && dto.Variants.Count > 0;
         var product = new Product
         {
             Id = Guid.NewGuid(),
@@ -254,7 +260,8 @@ public class ProductService : IProductService
             Unit = string.IsNullOrWhiteSpace(dto.Unit) ? "Chiếc" : dto.Unit.Trim(),
             CostPrice = dto.CostPrice,
             SalePrice = dto.SalePrice,
-            CurrentStock = dto.CurrentStock,
+            // Có phân loại màu: tồn kho = tổng tồn các màu (tính sau khi lưu màu)
+            CurrentStock = hasVariants ? 0 : dto.CurrentStock,
             MinStockAlert = dto.MinStockAlert,
             SquishyType = dto.SquishyType,
             MainImageUrl = dto.MainImageUrl,
@@ -264,12 +271,31 @@ public class ProductService : IProductService
             IsDeleted = false
         };
 
-        var sql = @"INSERT INTO Product (Id, CategoryId, Sku, Name, Description, Unit, CostPrice, SalePrice, CurrentStock, MinStockAlert, SquishyType, MainImageUrl, IsActive, CreatedAt, UpdatedAt, IsDeleted)
-                    VALUES (@Id, @CategoryId, @Sku, @Name, @Description, @Unit, @CostPrice, @SalePrice, @CurrentStock, @MinStockAlert, @SquishyType, @MainImageUrl, @IsActive, @CreatedAt, @UpdatedAt, @IsDeleted)";
-        await connection.ExecuteAsync(sql, product);
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        try
+        {
+            await connection.ExecuteAsync(@"INSERT INTO Product (Id, CategoryId, Sku, Name, Description, Unit, CostPrice, SalePrice, CurrentStock, MinStockAlert, SquishyType, MainImageUrl, IsActive, CreatedAt, UpdatedAt, IsDeleted)
+                    VALUES (@Id, @CategoryId, @Sku, @Name, @Description, @Unit, @CostPrice, @SalePrice, @CurrentStock, @MinStockAlert, @SquishyType, @MainImageUrl, @IsActive, @CreatedAt, @UpdatedAt, @IsDeleted)",
+                product, transaction);
 
-        // Gắn ảnh/video đã tải lên vào sản phẩm (không tạo bản ghi mới để tránh trùng trong thư viện)
-        await SyncProductMediaAsync(connection, product.Id, dto.ImageUrls, dto.VideoUrls);
+            // Gắn ảnh/video đã tải lên vào sản phẩm (không tạo bản ghi mới để tránh trùng trong thư viện)
+            await SyncProductMediaAsync(connection, transaction, product.Id, dto.ImageUrls, dto.VideoUrls);
+
+            var variantError = await SyncVariantsAsync(connection, transaction, product.Id, dto.Variants, 0, dto.CostPrice);
+            if (variantError != null)
+            {
+                transaction.Rollback();
+                return new RestData<ProductDto> { IsSuccess = false, Message = variantError };
+            }
+
+            transaction.Commit();
+        }
+        catch
+        {
+            transaction.Rollback();
+            throw;
+        }
 
         return await GetByIdAsync(product.Id);
     }
@@ -282,37 +308,165 @@ public class ProductService : IProductService
         if (exists > 0)
             return new RestData<ProductDto> { IsSuccess = false, Message = $"Mã SKU '{dto.Sku}' đã thuộc về sản phẩm khác." };
 
-        var sql = @"UPDATE Product 
-                    SET CategoryId = @CategoryId, Sku = @Sku, Name = @Name, Description = @Description,
-                        Unit = @Unit, CostPrice = @CostPrice, SalePrice = @SalePrice, CurrentStock = @CurrentStock,
-                        MinStockAlert = @MinStockAlert, SquishyType = @SquishyType, MainImageUrl = @MainImageUrl,
-                        IsActive = @IsActive, UpdatedAt = GETDATE()
-                    WHERE Id = @Id AND IsDeleted = 0";
-
-        var affected = await connection.ExecuteAsync(sql, new
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        try
         {
-            Id = id,
-            dto.CategoryId,
-            Sku = dto.Sku.Trim().ToUpper(),
-            Name = dto.Name.Trim(),
-            dto.Description,
-            Unit = string.IsNullOrWhiteSpace(dto.Unit) ? "Chiếc" : dto.Unit.Trim(),
-            dto.CostPrice,
-            dto.SalePrice,
-            dto.CurrentStock,
-            dto.MinStockAlert,
-            dto.SquishyType,
-            dto.MainImageUrl,
-            dto.IsActive
-        });
+            var current = await connection.QueryFirstOrDefaultAsync<Product>(
+                "SELECT * FROM Product WITH (UPDLOCK) WHERE Id = @Id AND IsDeleted = 0", new { Id = id }, transaction);
+            if (current == null)
+            {
+                transaction.Rollback();
+                return new RestData<ProductDto> { IsSuccess = false, Message = "Không tìm thấy sản phẩm." };
+            }
 
-        if (affected == 0)
-            return new RestData<ProductDto> { IsSuccess = false, Message = "Không tìm thấy sản phẩm." };
+            // Đã / sẽ có phân loại màu: tồn kho và giá vốn do các màu quyết định, không ghi đè từ form
+            var hadVariants = await Inventory.HasVariantsAsync(connection, transaction, id);
+            var keepStock = hadVariants || (dto.Variants != null && dto.Variants.Count > 0);
 
-        // Cập nhật lại media nếu truyền vào danh sách
-        await SyncProductMediaAsync(connection, id, dto.ImageUrls, dto.VideoUrls);
+            await connection.ExecuteAsync(@"UPDATE Product
+                    SET CategoryId = @CategoryId, Sku = @Sku, Name = @Name, Description = @Description,
+                        Unit = @Unit, SalePrice = @SalePrice, MinStockAlert = @MinStockAlert, SquishyType = @SquishyType,
+                        MainImageUrl = @MainImageUrl, IsActive = @IsActive, UpdatedAt = GETDATE(),
+                        CostPrice = CASE WHEN @KeepStock = 1 THEN CostPrice ELSE @CostPrice END,
+                        CurrentStock = CASE WHEN @KeepStock = 1 THEN CurrentStock ELSE @CurrentStock END
+                    WHERE Id = @Id",
+                new
+                {
+                    Id = id,
+                    dto.CategoryId,
+                    Sku = dto.Sku.Trim().ToUpper(),
+                    Name = dto.Name.Trim(),
+                    dto.Description,
+                    Unit = string.IsNullOrWhiteSpace(dto.Unit) ? "Chiếc" : dto.Unit.Trim(),
+                    dto.CostPrice,
+                    dto.SalePrice,
+                    dto.CurrentStock,
+                    dto.MinStockAlert,
+                    dto.SquishyType,
+                    dto.MainImageUrl,
+                    dto.IsActive,
+                    KeepStock = keepStock
+                }, transaction);
+
+            // Cập nhật lại media nếu truyền vào danh sách
+            await SyncProductMediaAsync(connection, transaction, id, dto.ImageUrls, dto.VideoUrls);
+
+            var variantError = await SyncVariantsAsync(connection, transaction, id, dto.Variants,
+                hadVariants ? 0 : current.CurrentStock, current.CostPrice);
+            if (variantError != null)
+            {
+                transaction.Rollback();
+                return new RestData<ProductDto> { IsSuccess = false, Message = variantError };
+            }
+
+            transaction.Commit();
+        }
+        catch
+        {
+            transaction.Rollback();
+            throw;
+        }
 
         return await GetByIdAsync(id);
+    }
+
+    /// <summary>
+    /// Lưu danh sách màu của sản phẩm. Trả về lỗi hoặc null.
+    /// - Màu mới: tạo với tồn đầu kỳ (ghi thẻ kho "OPENING").
+    /// - Sản phẩm đang có hàng mà chưa chia màu: tồn hiện có chuyển sang màu đầu tiên ("VARIANT_SPLIT").
+    /// - Màu bị bỏ khỏi danh sách: chỉ xóa được khi đã hết hàng.
+    /// </summary>
+    private static async Task<string?> SyncVariantsAsync(IDbConnection connection, IDbTransaction transaction, Guid productId,
+        List<SaveProductVariantDto>? incoming, int stockToMove, decimal productCost)
+    {
+        if (incoming == null) return null;
+
+        foreach (var v in incoming)
+        {
+            v.Name = (v.Name ?? "").Trim();
+            v.ColorHex = string.IsNullOrWhiteSpace(v.ColorHex) ? null : v.ColorHex.Trim();
+            v.ImageUrl = string.IsNullOrWhiteSpace(v.ImageUrl) ? null : v.ImageUrl.Trim();
+            if (v.Name.Length == 0 || v.Name.Length > 50) return "Tên màu không được để trống (tối đa 50 ký tự).";
+            if (v.ColorHex != null && !Regex.IsMatch(v.ColorHex, "^#[0-9A-Fa-f]{6}$"))
+                return $"Mã màu của \"{v.Name}\" không hợp lệ.";
+            if (v.InitialStock < 0) return $"Tồn đầu kỳ của \"{v.Name}\" không được âm.";
+        }
+        var dup = incoming.GroupBy(v => v.Name.ToLowerInvariant()).FirstOrDefault(g => g.Count() > 1);
+        if (dup != null) return $"Màu \"{dup.First().Name}\" bị trùng tên.";
+
+        var existing = (await connection.QueryAsync<ProductVariant>(
+            "SELECT * FROM ProductVariant WITH (UPDLOCK) WHERE ProductId = @Id AND IsDeleted = 0", new { Id = productId }, transaction)).ToList();
+
+        var keepIds = incoming.Where(v => v.Id.HasValue).Select(v => v.Id!.Value).ToHashSet();
+        foreach (var removed in existing.Where(e => !keepIds.Contains(e.Id)))
+        {
+            if (removed.CurrentStock > 0)
+                return $"Màu \"{removed.Name}\" còn {removed.CurrentStock} chiếc nên không xóa được. Hãy tắt \"Đang bán\" cho màu này.";
+            await connection.ExecuteAsync("UPDATE ProductVariant SET IsDeleted = 1, IsActive = 0, UpdatedAt = GETDATE() WHERE Id = @Id",
+                new { removed.Id }, transaction);
+        }
+
+        var moveStock = existing.Count == 0 && stockToMove > 0;
+        var order = 1;
+        foreach (var v in incoming)
+        {
+            Guid variantId;
+            if (v.Id.HasValue)
+            {
+                if (!existing.Any(e => e.Id == v.Id)) return $"Màu \"{v.Name}\" không còn tồn tại, vui lòng tải lại trang.";
+                variantId = v.Id.Value;
+                await connection.ExecuteAsync(@"UPDATE ProductVariant SET Name = @Name, ColorHex = @ColorHex, ImageUrl = @ImageUrl,
+                        DisplayOrder = @Order, IsActive = @IsActive, UpdatedAt = GETDATE() WHERE Id = @Id",
+                    new { Id = variantId, v.Name, v.ColorHex, v.ImageUrl, Order = order, v.IsActive }, transaction);
+            }
+            else
+            {
+                variantId = Guid.NewGuid();
+                await connection.ExecuteAsync(@"INSERT INTO ProductVariant (Id, ProductId, Name, ColorHex, ImageUrl, CurrentStock, CostPrice, DisplayOrder, IsActive, CreatedAt, UpdatedAt, IsDeleted)
+                        VALUES (@Id, @ProductId, @Name, @ColorHex, @ImageUrl, 0, @Cost, @Order, @IsActive, GETDATE(), GETDATE(), 0)",
+                    new { Id = variantId, ProductId = productId, v.Name, v.ColorHex, v.ImageUrl, Cost = productCost, Order = order, v.IsActive }, transaction);
+
+                if (moveStock)
+                {
+                    await Inventory.ChangeAsync(connection, transaction, productId, variantId, stockToMove, "VARIANT_SPLIT", null,
+                        $"Chuyển {stockToMove} chiếc tồn kho hiện có sang màu {v.Name}", Inventory.CostMode.Import, productCost);
+                    moveStock = false;
+                }
+                if (v.InitialStock > 0)
+                {
+                    await Inventory.ChangeAsync(connection, transaction, productId, variantId, v.InitialStock, "OPENING", null,
+                        $"Tồn đầu kỳ màu {v.Name}", Inventory.CostMode.Import, productCost);
+                }
+            }
+
+            // Ảnh của màu: gắn vào màu để không hiện lẻ loi trong thư viện
+            if (v.ImageUrl != null)
+            {
+                await connection.ExecuteAsync(@"UPDATE MediaImage SET EntityId = @Id, EntityType = 'PRODUCT_VARIANT', UpdatedAt = GETDATE()
+                        WHERE Url = @Url AND IsDeleted = 0 AND EntityId IS NULL", new { Id = variantId, Url = v.ImageUrl }, transaction);
+            }
+            order++;
+        }
+
+        if (incoming.Count > 0)
+            await Inventory.RecalcProductAsync(connection, transaction, productId);
+        else if (existing.Count > 0)
+            // Bỏ hết màu (đều đã hết hàng): sản phẩm quay về quản lý tồn kho chung, bắt đầu từ 0
+            await connection.ExecuteAsync("UPDATE Product SET CurrentStock = 0, UpdatedAt = GETDATE() WHERE Id = @Id", new { Id = productId }, transaction);
+
+        return null;
+    }
+
+    private static async Task LoadVariantsAsync(IDbConnection connection, IEnumerable<ProductDto> products)
+    {
+        var list = products.ToList();
+        if (list.Count == 0) return;
+        var variants = (await connection.QueryAsync<ProductVariantDto>(
+            "SELECT * FROM ProductVariant WHERE ProductId IN @Ids AND IsDeleted = 0 ORDER BY DisplayOrder, Name",
+            new { Ids = list.Select(p => p.Id).ToList() })).ToList();
+        foreach (var p in list)
+            p.Variants = variants.Where(v => v.ProductId == p.Id).ToList();
     }
 
     public async Task<RestData<bool>> DeleteAsync(Guid id)
@@ -328,15 +482,15 @@ public class ProductService : IProductService
     /// nên thư viện không bị nhân đôi. Ảnh không còn trong danh sách thì gỡ khỏi sản phẩm.
     /// null = không đổi media (giữ nguyên).
     /// </summary>
-    private static async Task SyncProductMediaAsync(IDbConnection connection, Guid productId, List<string>? imageUrls, List<string>? videoUrls)
+    private static async Task SyncProductMediaAsync(IDbConnection connection, IDbTransaction? transaction, Guid productId, List<string>? imageUrls, List<string>? videoUrls)
     {
         if (imageUrls != null)
-            await SyncMediaTableAsync(connection, "MediaImage", productId, imageUrls, withPrimary: true);
+            await SyncMediaTableAsync(connection, transaction, "MediaImage", productId, imageUrls, withPrimary: true);
         if (videoUrls != null)
-            await SyncMediaTableAsync(connection, "MediaVideo", productId, videoUrls, withPrimary: false);
+            await SyncMediaTableAsync(connection, transaction, "MediaVideo", productId, videoUrls, withPrimary: false);
     }
 
-    private static async Task SyncMediaTableAsync(IDbConnection connection, string table, Guid productId, List<string> urls, bool withPrimary)
+    private static async Task SyncMediaTableAsync(IDbConnection connection, IDbTransaction? transaction, string table, Guid productId, List<string> urls, bool withPrimary)
     {
         var list = urls.Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim()).Distinct().ToList();
 
@@ -344,7 +498,7 @@ public class ProductService : IProductService
         await connection.ExecuteAsync(
             $"UPDATE {table} SET IsDeleted = 1, UpdatedAt = GETDATE() WHERE EntityId = @Id AND EntityType = 'PRODUCT' AND IsDeleted = 0" +
             (list.Count > 0 ? " AND Url NOT IN @Urls" : ""),
-            new { Id = productId, Urls = list });
+            new { Id = productId, Urls = list }, transaction);
 
         var order = 1;
         foreach (var url in list)
@@ -355,13 +509,13 @@ public class ProductService : IProductService
                 SELECT TOP 1 Id FROM {table}
                 WHERE Url = @Url AND EntityType = 'PRODUCT' AND IsDeleted = 0 AND (EntityId = @Id OR EntityId IS NULL)
                 ORDER BY CASE WHEN EntityId = @Id THEN 0 ELSE 1 END, CreatedAt",
-                new { Url = url, Id = productId });
+                new { Url = url, Id = productId }, transaction);
 
             if (existingId.HasValue)
             {
                 await connection.ExecuteAsync(
                     $"UPDATE {table} SET EntityId = @Id, DisplayOrder = @Order{primarySet}, UpdatedAt = GETDATE() WHERE Id = @MediaId",
-                    new { Id = productId, Order = order, IsPrimary = order == 1, MediaId = existingId.Value });
+                    new { Id = productId, Order = order, IsPrimary = order == 1, MediaId = existingId.Value }, transaction);
             }
             else
             {
@@ -372,7 +526,7 @@ public class ProductService : IProductService
                         VALUES (NEWID(), @Id, 'PRODUCT', @Url, @FileName, @IsPrimary, @Order, GETDATE(), GETDATE(), 0)"
                     : @"INSERT INTO MediaVideo (Id, EntityId, EntityType, Url, FileName, DisplayOrder, CreatedAt, UpdatedAt, IsDeleted)
                         VALUES (NEWID(), @Id, 'PRODUCT', @Url, @FileName, @Order, GETDATE(), GETDATE(), 0)",
-                    new { Id = productId, Url = url, FileName = fileName, IsPrimary = order == 1, Order = order });
+                    new { Id = productId, Url = url, FileName = fileName, IsPrimary = order == 1, Order = order }, transaction);
             }
             order++;
         }

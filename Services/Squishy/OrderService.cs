@@ -86,9 +86,10 @@ public class OrderService : IOrderService
         {
             var orderIds = orders.Select(o => o.Id).ToList();
             var details = (await connection.QueryAsync<OrderItemDto>(@"
-                SELECT d.*, p.MainImageUrl
+                SELECT d.*, COALESCE(v.ImageUrl, p.MainImageUrl) AS MainImageUrl
                 FROM OrderDetail d
                 LEFT JOIN Product p ON d.ProductId = p.Id
+                LEFT JOIN ProductVariant v ON v.Id = d.VariantId
                 WHERE d.OrderId IN @Ids", new { Ids = orderIds })).ToList();
 
             foreach (var o in orders)
@@ -110,9 +111,10 @@ public class OrderService : IOrderService
             return new RestData<OrderDto> { IsSuccess = false, Message = "Không tìm thấy đơn hàng." };
 
         var details = (await connection.QueryAsync<OrderItemDto>(@"
-            SELECT d.*, p.MainImageUrl
+            SELECT d.*, COALESCE(v.ImageUrl, p.MainImageUrl) AS MainImageUrl
             FROM OrderDetail d
             LEFT JOIN Product p ON d.ProductId = p.Id
+                LEFT JOIN ProductVariant v ON v.Id = d.VariantId
             WHERE d.OrderId = @Id", new { Id = id })).ToList();
 
         order.Details = details;
@@ -183,6 +185,18 @@ public class OrderService : IOrderService
 
                 if (product == null)
                     throw new Exception($"Sản phẩm không tồn tại (ID: {item.ProductId}).");
+                if (item.Quantity <= 0)
+                    throw new Exception($"Số lượng của \"{product.Name}\" phải lớn hơn 0.");
+
+                // Sản phẩm có phân loại màu thì bắt buộc chọn màu đang bán
+                var variantError = await Inventory.ValidateVariantAsync(connection, transaction, product.Id, item.VariantId, product.Name, requireActive: true);
+                if (variantError != null) throw new Exception(variantError);
+                var variantName = await Inventory.GetVariantNameAsync(connection, transaction, item.VariantId);
+                var lineName = variantName == null ? product.Name : $"{product.Name} - {variantName}";
+
+                var stock = await Inventory.GetStockAsync(connection, transaction, product.Id, item.VariantId);
+                if (stock < item.Quantity)
+                    throw new Exception($"\"{lineName}\" chỉ còn {stock} chiếc.");
 
                 var itemTotal = item.Quantity * item.UnitPrice;
                 subTotal += itemTotal;
@@ -192,10 +206,12 @@ public class OrderService : IOrderService
                     Id = Guid.NewGuid(),
                     OrderId = orderId,
                     ProductId = product.Id,
-                    ProductName = product.Name,
+                    VariantId = item.VariantId,
+                    ProductName = lineName,
+                    VariantName = variantName,
                     Quantity = item.Quantity,
                     UnitPrice = item.UnitPrice,
-                    CostPrice = product.CostPrice,
+                    CostPrice = await Inventory.GetCostAsync(connection, transaction, product.Id, item.VariantId),
                     TotalPrice = itemTotal,
                     CreatedAt = DateTime.Now
                 });
@@ -203,27 +219,8 @@ public class OrderService : IOrderService
                 // Nếu là tiền mặt tại quầy: Trừ kho ngay lập tức
                 if (isCash)
                 {
-                    var qtyBefore = product.CurrentStock;
-                    var qtyChange = item.Quantity;
-                    var qtyAfter = Math.Max(0, qtyBefore - qtyChange);
-
-                    await connection.ExecuteAsync(
-                        "UPDATE Product SET CurrentStock = @QtyAfter, UpdatedAt = GETDATE() WHERE Id = @Id",
-                        new { QtyAfter = qtyAfter, Id = product.Id }, transaction);
-
-                    await connection.ExecuteAsync(@"
-                        INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-                        VALUES (@Id, @ProductId, 'EXPORT', @ReferenceCode, @QuantityBefore, -@QuantityChange, @QuantityAfter, @Note, GETDATE())",
-                        new
-                        {
-                            Id = Guid.NewGuid(),
-                            ProductId = product.Id,
-                            ReferenceCode = orderCode,
-                            QuantityBefore = qtyBefore,
-                            QuantityChange = qtyChange,
-                            QuantityAfter = qtyAfter,
-                            Note = $"Xuất bán tại quầy đơn {orderCode}"
-                        }, transaction);
+                    await Inventory.ChangeAsync(connection, transaction, product.Id, item.VariantId, -item.Quantity, "EXPORT", orderCode,
+                        $"Xuất bán tại quầy đơn {orderCode}");
                 }
             }
 
@@ -264,8 +261,8 @@ public class OrderService : IOrderService
             await connection.ExecuteAsync(insertOrderSql, order, transaction);
 
             var insertDetailSql = @"
-                INSERT INTO OrderDetail (Id, OrderId, ProductId, ProductName, Quantity, UnitPrice, CostPrice, TotalPrice, CreatedAt)
-                VALUES (@Id, @OrderId, @ProductId, @ProductName, @Quantity, @UnitPrice, @CostPrice, @TotalPrice, @CreatedAt)";
+                INSERT INTO OrderDetail (Id, OrderId, ProductId, VariantId, ProductName, VariantName, Quantity, UnitPrice, CostPrice, TotalPrice, CreatedAt)
+                VALUES (@Id, @OrderId, @ProductId, @VariantId, @ProductName, @VariantName, @Quantity, @UnitPrice, @CostPrice, @TotalPrice, @CreatedAt)";
             foreach (var detail in orderDetailsToInsert)
             {
                 await connection.ExecuteAsync(insertDetailSql, detail, transaction);
@@ -331,19 +328,8 @@ public class OrderService : IOrderService
             var details = await connection.QueryAsync<OrderDetail>("SELECT * FROM OrderDetail WHERE OrderId = @Id", new { Id = id });
             foreach (var item in details)
             {
-                var product = await connection.QueryFirstOrDefaultAsync<Product>("SELECT * FROM Product WHERE Id = @Id", new { Id = item.ProductId });
-                if (product != null)
-                {
-                    var qtyBefore = product.CurrentStock;
-                    var qtyChange = item.Quantity;
-                    var qtyAfter = Math.Max(0, qtyBefore - qtyChange);
-
-                    await connection.ExecuteAsync("UPDATE Product SET CurrentStock = @QtyAfter WHERE Id = @Id", new { QtyAfter = qtyAfter, Id = product.Id });
-                    await connection.ExecuteAsync(@"
-                        INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-                        VALUES (NEWID(), @ProductId, 'EXPORT', @ReferenceCode, @QuantityBefore, -@QuantityChange, @QuantityAfter, N'Xuất bán đơn hàng', GETDATE())",
-                        new { ProductId = product.Id, ReferenceCode = order.OrderCode, QuantityBefore = qtyBefore, QuantityChange = qtyChange, QuantityAfter = qtyAfter });
-                }
+                await Inventory.ChangeAsync(connection, null, item.ProductId, item.VariantId, -item.Quantity, "EXPORT", order.OrderCode,
+                    $"Xuất bán đơn hàng {order.OrderCode}");
             }
         }
         else if (newOrderStatus == "CANCELLED" && (order.OrderStatus == "COMPLETED" || order.PaymentStatus == "PAID"))
@@ -351,19 +337,8 @@ public class OrderService : IOrderService
             var details = await connection.QueryAsync<OrderDetail>("SELECT * FROM OrderDetail WHERE OrderId = @Id", new { Id = id });
             foreach (var item in details)
             {
-                var product = await connection.QueryFirstOrDefaultAsync<Product>("SELECT * FROM Product WHERE Id = @Id", new { Id = item.ProductId });
-                if (product != null)
-                {
-                    var qtyBefore = product.CurrentStock;
-                    var qtyChange = item.Quantity;
-                    var qtyAfter = qtyBefore + qtyChange;
-
-                    await connection.ExecuteAsync("UPDATE Product SET CurrentStock = @QtyAfter WHERE Id = @Id", new { QtyAfter = qtyAfter, Id = product.Id });
-                    await connection.ExecuteAsync(@"
-                        INSERT INTO StockTransaction (Id, ProductId, TransactionType, ReferenceCode, QuantityBefore, QuantityChange, QuantityAfter, Note, CreatedAt)
-                        VALUES (NEWID(), @ProductId, 'IMPORT', @ReferenceCode, @QuantityBefore, @QuantityChange, @QuantityAfter, N'Hoàn kho do hủy đơn', GETDATE())",
-                        new { ProductId = product.Id, ReferenceCode = order.OrderCode, QuantityBefore = qtyBefore, QuantityChange = qtyChange, QuantityAfter = qtyAfter });
-                }
+                await Inventory.ChangeAsync(connection, null, item.ProductId, item.VariantId, item.Quantity, "ORDER_CANCEL", order.OrderCode,
+                    $"Hoàn kho do hủy đơn {order.OrderCode}");
             }
         }
 

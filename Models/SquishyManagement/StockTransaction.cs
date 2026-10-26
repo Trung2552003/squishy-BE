@@ -10,6 +10,7 @@ public class StockTransaction
     [Key]
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid ProductId { get; set; }
+    public Guid? VariantId { get; set; }
     public string TransactionType { get; set; } = "IMPORT"; // IMPORT, EXPORT, ADJUST
     public string? ReferenceCode { get; set; }
     public int QuantityBefore { get; set; }

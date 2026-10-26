@@ -12,6 +12,7 @@ public class ReturnRequestItem
     public Guid ReturnRequestId { get; set; }
     public Guid OrderDetailId { get; set; }
     public Guid ProductId { get; set; }
+    public Guid? VariantId { get; set; }
     public string ProductName { get; set; } = string.Empty;
     public int Quantity { get; set; }
     public decimal UnitPrice { get; set; }
@@ -22,6 +23,7 @@ public class ReturnRequestItem
 
     // Chỉ dùng cho phiếu đổi hàng: sản phẩm giao lại cho khách
     public Guid? ExchangeProductId { get; set; }
+    public Guid? ExchangeVariantId { get; set; }
     public string? ExchangeProductName { get; set; }
     public int ExchangeQuantity { get; set; }
     public decimal ExchangeUnitPrice { get; set; }

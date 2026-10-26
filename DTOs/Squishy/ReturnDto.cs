@@ -9,12 +9,14 @@ public class ReturnItemDto
     public Guid ReturnRequestId { get; set; }
     public Guid OrderDetailId { get; set; }
     public Guid ProductId { get; set; }
+    public Guid? VariantId { get; set; }
     public string ProductName { get; set; } = string.Empty;
     public string? MainImageUrl { get; set; }
     public int Quantity { get; set; }
     public decimal UnitPrice { get; set; }
     public string ItemCondition { get; set; } = "DEFECTIVE";
     public Guid? ExchangeProductId { get; set; }
+    public Guid? ExchangeVariantId { get; set; }
     public string? ExchangeProductName { get; set; }
     public int ExchangeQuantity { get; set; }
     public decimal ExchangeUnitPrice { get; set; }
@@ -50,6 +52,7 @@ public class ReturnableOrderItemDto
 {
     public Guid OrderDetailId { get; set; }
     public Guid ProductId { get; set; }
+    public Guid? VariantId { get; set; }
     public string ProductName { get; set; } = string.Empty;
     public string? MainImageUrl { get; set; }
     public int Quantity { get; set; }
@@ -79,6 +82,7 @@ public class CreateReturnItemRequest
     public int Quantity { get; set; }
     public string ItemCondition { get; set; } = "DEFECTIVE";
     public Guid? ExchangeProductId { get; set; }
+    public Guid? ExchangeVariantId { get; set; }
     public int ExchangeQuantity { get; set; }
 }
 
