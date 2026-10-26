@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -20,6 +22,7 @@ public interface IOrderService
     Task<RestData<OrderDto>> CreateOrderAsync(CreateOrderRequest request);
     Task<RestData<OrderDto>> UpdateStatusAsync(Guid id, UpdateOrderStatusRequest request);
     Task<RestData<OrderDto>> UpdateFulfillmentAsync(Guid id, UpdateFulfillmentRequest request);
+    Task<RestData<OrderDto>> UpdateInfoAsync(Guid id, UpdateOrderInfoRequest request);
     Task<RestData<bool>> UploadPaymentProofAsync(Guid orderId, string imageUrl);
 }
 
@@ -225,8 +228,12 @@ public class OrderService : IOrderService
             }
 
             var discount = Math.Max(0, request.DiscountAmount);
-            var shippingFee = Math.Max(0, request.ShippingFee);
-            var totalAmount = Math.Max(0, subTotal - discount + shippingFee);
+            var isDelivery = !string.Equals(request.OrderType, "POS", StringComparison.OrdinalIgnoreCase);
+            var shippingFee = isDelivery ? Math.Max(0, request.ShippingFee) : 0;
+            var shippingPayer = NormalizePayer(request.ShippingPayer);
+            if (shippingPayer == null)
+                throw new Exception("Người trả phí ship không hợp lệ.");
+            var totalAmount = CalcTotal(subTotal, discount, shippingFee, shippingPayer);
 
             var order = new Order
             {
@@ -245,6 +252,7 @@ public class OrderService : IOrderService
                 ShippingProvider = request.ShippingProvider,
                 TrackingCode = request.TrackingCode,
                 ShippingFee = shippingFee,
+                ShippingPayer = shippingPayer,
                 PreparationStatus = "PENDING",
                 TransferContent = transferContent,
                 PaidAt = isCash ? DateTime.Now : null,
@@ -256,8 +264,8 @@ public class OrderService : IOrderService
             };
 
             var insertOrderSql = @"
-                INSERT INTO [Order] (Id, OrderCode, CustomerName, CustomerPhone, OrderType, SubTotal, DiscountAmount, TotalAmount, PaymentMethod, PaymentStatus, OrderStatus, ShippingAddress, ShippingProvider, TrackingCode, ShippingFee, PreparationStatus, TransferContent, PaidAt, PaymentProofImageUrl, Note, CreatedAt, UpdatedAt, IsDeleted)
-                VALUES (@Id, @OrderCode, @CustomerName, @CustomerPhone, @OrderType, @SubTotal, @DiscountAmount, @TotalAmount, @PaymentMethod, @PaymentStatus, @OrderStatus, @ShippingAddress, @ShippingProvider, @TrackingCode, @ShippingFee, @PreparationStatus, @TransferContent, @PaidAt, @PaymentProofImageUrl, @Note, @CreatedAt, @UpdatedAt, @IsDeleted)";
+                INSERT INTO [Order] (Id, OrderCode, CustomerName, CustomerPhone, OrderType, SubTotal, DiscountAmount, TotalAmount, PaymentMethod, PaymentStatus, OrderStatus, ShippingAddress, ShippingProvider, TrackingCode, ShippingFee, ShippingPayer, PreparationStatus, TransferContent, PaidAt, PaymentProofImageUrl, Note, CreatedAt, UpdatedAt, IsDeleted)
+                VALUES (@Id, @OrderCode, @CustomerName, @CustomerPhone, @OrderType, @SubTotal, @DiscountAmount, @TotalAmount, @PaymentMethod, @PaymentStatus, @OrderStatus, @ShippingAddress, @ShippingProvider, @TrackingCode, @ShippingFee, @ShippingPayer, @PreparationStatus, @TransferContent, @PaidAt, @PaymentProofImageUrl, @Note, @CreatedAt, @UpdatedAt, @IsDeleted)";
             await connection.ExecuteAsync(insertOrderSql, order, transaction);
 
             var insertDetailSql = @"
@@ -393,4 +401,84 @@ public class OrderService : IOrderService
 
         return new RestData<bool> { IsSuccess = true, Data = true, Message = "Đã cập nhật ảnh chứng minh thanh toán." };
     }
+
+    /// <summary>
+    /// Sửa thông tin đơn khi nhập sai. Tổng tiền khách trả = tiền hàng − giảm giá + (phí ship nếu người nhận trả).
+    /// Đơn đã thanh toán thì không cho đổi các khoản làm thay đổi số tiền khách trả (tránh lệch với tiền đã nhận).
+    /// </summary>
+    public async Task<RestData<OrderDto>> UpdateInfoAsync(Guid id, UpdateOrderInfoRequest request)
+    {
+        using var connection = _connectionFactory.CreateConnection();
+        var order = await connection.QueryFirstOrDefaultAsync<Order>(
+            "SELECT * FROM [Order] WHERE Id = @Id AND IsDeleted = 0", new { Id = id });
+        if (order == null)
+            return FailOrder("Không tìm thấy đơn hàng.");
+        if (order.OrderStatus is "CANCELLED" or "RETURNED")
+            return FailOrder("Đơn đã hủy / đã hoàn hàng nên không sửa được.");
+
+        var payer = NormalizePayer(request.ShippingPayer);
+        if (payer == null)
+            return FailOrder("Người trả phí ship không hợp lệ.");
+        if (request.ShippingFee < 0 || request.DiscountAmount < 0)
+            return FailOrder("Phí ship và giảm giá không được âm.");
+        if (request.DiscountAmount > order.SubTotal)
+            return FailOrder("Giảm giá không được lớn hơn tiền hàng.");
+
+        var name = string.IsNullOrWhiteSpace(request.CustomerName) ? (order.OrderType == "POS" ? "Khách lẻ" : null) : request.CustomerName.Trim();
+        if (name == null)
+            return FailOrder("Vui lòng nhập tên người nhận.");
+        var phone = string.IsNullOrWhiteSpace(request.CustomerPhone) ? null : Regex.Replace(request.CustomerPhone, @"[\s.\-]", "");
+        if (phone != null && !Regex.IsMatch(phone, @"^(0|\+84)\d{9}$"))
+            return FailOrder("Số điện thoại chưa đúng (VD: 0912345678).");
+
+        var isDelivery = order.OrderType != "POS";
+        if (isDelivery && string.IsNullOrWhiteSpace(request.ShippingAddress))
+            return FailOrder("Đơn giao hàng cần có địa chỉ nhận hàng.");
+        var shippingFee = isDelivery ? request.ShippingFee : 0;
+        var newTotal = CalcTotal(order.SubTotal, request.DiscountAmount, shippingFee, payer);
+
+        if (order.PaymentStatus == "PAID" && newTotal != order.TotalAmount)
+            return FailOrder($"Đơn đã thanh toán {Vnd(order.TotalAmount)}, thay đổi này làm tổng thành {Vnd(newTotal)}. " +
+                             "Chỉ sửa được phí ship khi shop trả, hoặc thông tin người nhận / vận chuyển. Khoản chênh lệch hãy ghi ở Thu chi khác.");
+
+        await connection.ExecuteAsync(@"
+            UPDATE [Order]
+            SET CustomerName = @CustomerName, CustomerPhone = @CustomerPhone, ShippingAddress = @ShippingAddress, Note = @Note,
+                ShippingProvider = @ShippingProvider, TrackingCode = @TrackingCode, ShippingFee = @ShippingFee, ShippingPayer = @ShippingPayer,
+                DiscountAmount = @DiscountAmount, TotalAmount = @TotalAmount, UpdatedAt = GETDATE()
+            WHERE Id = @Id",
+            new
+            {
+                Id = id,
+                CustomerName = name,
+                CustomerPhone = phone,
+                ShippingAddress = isDelivery ? request.ShippingAddress!.Trim() : null,
+                Note = string.IsNullOrWhiteSpace(request.Note) ? null : request.Note.Trim(),
+                ShippingProvider = string.IsNullOrWhiteSpace(request.ShippingProvider) ? null : request.ShippingProvider.Trim(),
+                TrackingCode = string.IsNullOrWhiteSpace(request.TrackingCode) ? null : request.TrackingCode.Trim().ToUpperInvariant(),
+                ShippingFee = shippingFee,
+                ShippingPayer = payer,
+                request.DiscountAmount,
+                TotalAmount = newTotal
+            });
+
+        var result = await GetByIdAsync(id);
+        result.Message = "Đã cập nhật đơn hàng.";
+        return result;
+    }
+
+    /// <summary>Tổng khách trả: phí ship chỉ cộng vào khi người nhận trả; shop trả thì là chi phí của shop.</summary>
+    private static decimal CalcTotal(decimal subTotal, decimal discount, decimal shippingFee, string payer) =>
+        Math.Max(0, subTotal - discount + (payer == "RECEIVER" ? shippingFee : 0));
+
+    private static string? NormalizePayer(string? payer)
+    {
+        var p = string.IsNullOrWhiteSpace(payer) ? "RECEIVER" : payer.Trim().ToUpperInvariant();
+        return p is "RECEIVER" or "SENDER" ? p : null;
+    }
+
+    private static string Vnd(decimal value) =>
+        value.ToString("N0", CultureInfo.GetCultureInfo("vi-VN")) + "đ";
+
+    private static RestData<OrderDto> FailOrder(string message) => new() { IsSuccess = false, Message = message };
 }

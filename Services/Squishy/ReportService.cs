@@ -121,8 +121,13 @@ public class ReportService : IReportService
         var args = new { From = from, To = to };
 
         // 1) Bán hàng
-        var sales = await connection.QueryFirstAsync<(decimal Revenue, decimal Shipping)>($@"
-            SELECT ISNULL(SUM(o.TotalAmount), 0), ISNULL(SUM(o.ShippingFee), 0)
+        // Ship người nhận trả: nằm trong tiền khách trả nhưng là tiền thu hộ cho đơn vị vận chuyển → tách ra khỏi doanh thu.
+        // Ship người gửi (shop) trả: không nằm trong tiền khách trả, là chi phí của shop.
+        var sales = await connection.QueryFirstAsync<(decimal Revenue, decimal Collected, decimal Expense)>($@"
+            SELECT
+                ISNULL(SUM(o.TotalAmount - CASE WHEN o.ShippingPayer = 'RECEIVER' THEN o.ShippingFee ELSE 0 END), 0),
+                ISNULL(SUM(CASE WHEN o.ShippingPayer = 'RECEIVER' THEN o.ShippingFee ELSE 0 END), 0),
+                ISNULL(SUM(CASE WHEN o.ShippingPayer = 'SENDER' THEN o.ShippingFee ELSE 0 END), 0)
             FROM [Order] o WHERE {PaidOrderFilter}", args);
         var cogs = await connection.ExecuteScalarAsync<decimal>($@"
             SELECT ISNULL(SUM(d.Quantity * d.CostPrice), 0)
@@ -146,7 +151,8 @@ public class ReportService : IReportService
             From = from,
             To = to,
             SalesRevenue = sales.Revenue,
-            ShippingFeeCollected = sales.Shipping,
+            ShippingFeeCollected = sales.Collected,
+            ShippingExpense = sales.Expense,
             ReturnRefunds = ret.Refund,
             ReturnExtraCharges = ret.Extra,
             RepairCost = ret.Repair,
@@ -158,9 +164,9 @@ public class ReportService : IReportService
             TotalCost = purchases
         };
         dto.GrossProfit = dto.TotalRevenue - dto.Cogs;
-        dto.NetProfit = dto.GrossProfit - dto.OperatingExpense + dto.OtherIncome;
+        dto.NetProfit = dto.GrossProfit - dto.ShippingExpense - dto.OperatingExpense + dto.OtherIncome;
         dto.CashIn = dto.SalesRevenue + dto.ReturnExtraCharges + dto.OtherIncome + dto.CapitalIn;
-        dto.CashOut = dto.TotalCost + dto.OperatingExpense + dto.ReturnRefunds + dto.RepairCost;
+        dto.CashOut = dto.TotalCost + dto.ShippingExpense + dto.OperatingExpense + dto.ReturnRefunds + dto.RepairCost;
         dto.NetCashFlow = dto.CashIn - dto.CashOut;
 
         if (withBreakdown)

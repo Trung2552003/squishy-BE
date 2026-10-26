@@ -1,5 +1,6 @@
 using System;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using SystemBase.BE.DTOs.Squishy;
 using SystemBase.BE.Services.Squishy;
@@ -51,6 +52,16 @@ public class OrderController : ControllerBase
     public async Task<IActionResult> UpdateStatus(Guid id, [FromBody] UpdateOrderStatusRequest request)
     {
         var result = await _orderService.UpdateStatusAsync(id, request);
+        if (!result.IsSuccess) return BadRequest(result);
+        return Ok(result);
+    }
+
+    /// <summary>Sửa đơn khi nhập sai (người nhận, phí ship, người trả ship, giảm giá, vận chuyển).</summary>
+    [Authorize]
+    [HttpPut("{id}")]
+    public async Task<IActionResult> UpdateInfo(Guid id, [FromBody] UpdateOrderInfoRequest request)
+    {
+        var result = await _orderService.UpdateInfoAsync(id, request);
         if (!result.IsSuccess) return BadRequest(result);
         return Ok(result);
     }

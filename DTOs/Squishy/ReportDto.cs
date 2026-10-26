@@ -5,12 +5,13 @@ namespace SystemBase.BE.DTOs.Squishy;
 
 /// <summary>
 /// Số liệu tài chính của một kỳ (from..to). Công thức:
-///   Doanh thu thuần   = Tiền đơn đã thanh toán (trừ đơn hủy) − Hoàn tiền đổi trả + Thu thêm đổi trả
+///   Tiền bán hàng     = Tiền khách trả của đơn đã thanh toán (trừ đơn hủy), KHÔNG gồm phí ship khách trả (tiền thu hộ cho đơn vị vận chuyển)
+///   Doanh thu thuần   = Tiền bán hàng − Hoàn tiền đổi trả + Thu thêm đổi trả
 ///   Giá vốn           = Giá vốn hàng đã bán − Hàng tốt nhập lại kho + Hàng xuất đổi + Chi phí sửa
 ///   Lợi nhuận gộp     = Doanh thu thuần − Giá vốn
-///   Lợi nhuận ròng    = Lợi nhuận gộp − Chi phí hoạt động + Thu nhập khác
+///   Lợi nhuận ròng    = Lợi nhuận gộp − Phí ship shop chịu − Chi phí hoạt động + Thu nhập khác
 ///   Tiền vào          = Tiền đơn đã thanh toán + Thu thêm đổi trả + Thu khác + Vốn được cấp
-///   Tiền ra           = Nhập hàng + Chi phí hoạt động + Hoàn tiền khách + Chi phí sửa
+///   Tiền ra           = Nhập hàng + Phí ship shop chịu + Chi phí hoạt động + Hoàn tiền khách + Chi phí sửa
 /// Tiền nhập hàng KHÔNG trừ thẳng vào lợi nhuận (đã tính qua giá vốn khi bán ra), chỉ nằm trong dòng tiền.
 /// </summary>
 public class DashboardSummaryDto
@@ -20,7 +21,8 @@ public class DashboardSummaryDto
 
     // Kết quả kinh doanh
     public decimal SalesRevenue { get; set; }
-    public decimal ShippingFeeCollected { get; set; }
+    public decimal ShippingFeeCollected { get; set; }  // ship khách trả: thu hộ, đã trả lại cho đơn vị vận chuyển
+    public decimal ShippingExpense { get; set; }       // ship shop trả (đơn "người gửi trả")
     public decimal ReturnRefunds { get; set; }
     public decimal ReturnExtraCharges { get; set; }
     public decimal TotalRevenue { get; set; }          // doanh thu thuần

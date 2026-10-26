@@ -24,7 +24,8 @@ public class Order
     public string? ShippingAddress { get; set; }
     public string? ShippingProvider { get; set; } // GHTK, GHN, ViettelPost, GrabExpress
     public string? TrackingCode { get; set; }
-    public decimal ShippingFee { get; set; }
+    public decimal ShippingFee { get; set; }        // phí trả cho đơn vị vận chuyển
+    public string ShippingPayer { get; set; } = "RECEIVER"; // RECEIVER: khách trả (cộng vào tổng) | SENDER: shop trả (chi phí của shop)
 
     // Khâu chuẩn bị & đóng hàng (Fulfillment)
     public string PreparationStatus { get; set; } = "PENDING"; // PENDING, PREPARING, PACKED, SHIPPED

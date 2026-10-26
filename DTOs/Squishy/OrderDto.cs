@@ -36,6 +36,7 @@ public class OrderDto
     public string? ShippingProvider { get; set; }
     public string? TrackingCode { get; set; }
     public decimal ShippingFee { get; set; }
+    public string ShippingPayer { get; set; } = "RECEIVER";
 
     // Khâu chuẩn bị & đóng gói
     public string PreparationStatus { get; set; } = "PENDING";
@@ -76,6 +77,7 @@ public class CreateOrderRequest
     public string? ShippingProvider { get; set; }
     public string? TrackingCode { get; set; }
     public decimal ShippingFee { get; set; }
+    public string ShippingPayer { get; set; } = "RECEIVER";
 
     public List<CreateOrderItemDto> Items { get; set; } = new();
 }
@@ -93,4 +95,18 @@ public class UpdateFulfillmentRequest
     public string? TrackingCode { get; set; }
     public string? ShippingProvider { get; set; }
     public string? PackingChecklistJson { get; set; }
+}
+
+/// <summary>Sửa đơn khi nhập sai: thông tin người nhận, giao hàng, phí ship, người trả ship, giảm giá.</summary>
+public class UpdateOrderInfoRequest
+{
+    public string? CustomerName { get; set; }
+    public string? CustomerPhone { get; set; }
+    public string? ShippingAddress { get; set; }
+    public string? Note { get; set; }
+    public string? ShippingProvider { get; set; }
+    public string? TrackingCode { get; set; }
+    public decimal ShippingFee { get; set; }
+    public string ShippingPayer { get; set; } = "RECEIVER";
+    public decimal DiscountAmount { get; set; }
 }
