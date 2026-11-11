@@ -48,6 +48,11 @@ public class SaveProductVariantDto
     public bool IsActive { get; set; } = true;
     /// <summary>Tồn đầu kỳ, chỉ dùng khi tạo màu mới (sau đó tồn kho thay đổi qua phiếu nhập / bán hàng)</summary>
     public int InitialStock { get; set; }
+    /// <summary>Màu đã có: số lượng muốn sửa thành (null = không sửa)</summary>
+    public int? Stock { get; set; }
+    /// <summary>Số lượng lúc mở form. Chênh lệch Stock - OriginalStock được cộng/trừ vào tồn thực tế,
+    /// nên đơn bán trong lúc đang sửa không bị ghi đè.</summary>
+    public int? OriginalStock { get; set; }
 }
 
 public class CreateUpdateProductDto
@@ -60,6 +65,8 @@ public class CreateUpdateProductDto
     public decimal CostPrice { get; set; }
     public decimal SalePrice { get; set; }
     public int CurrentStock { get; set; }
+    /// <summary>Tồn kho lúc mở form sửa (xem SaveProductVariantDto.OriginalStock)</summary>
+    public int? OriginalStock { get; set; }
     public int MinStockAlert { get; set; } = 5;
     public string? SquishyType { get; set; }
     public string? MainImageUrl { get; set; }

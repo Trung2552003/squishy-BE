@@ -328,8 +328,7 @@ public class ProductService : IProductService
                     SET CategoryId = @CategoryId, Sku = @Sku, Name = @Name, Description = @Description,
                         Unit = @Unit, SalePrice = @SalePrice, MinStockAlert = @MinStockAlert, SquishyType = @SquishyType,
                         MainImageUrl = @MainImageUrl, IsActive = @IsActive, UpdatedAt = GETDATE(),
-                        CostPrice = CASE WHEN @KeepStock = 1 THEN CostPrice ELSE @CostPrice END,
-                        CurrentStock = CASE WHEN @KeepStock = 1 THEN CurrentStock ELSE @CurrentStock END
+                        CostPrice = CASE WHEN @KeepStock = 1 THEN CostPrice ELSE @CostPrice END
                     WHERE Id = @Id",
                 new
                 {
@@ -341,13 +340,26 @@ public class ProductService : IProductService
                     Unit = string.IsNullOrWhiteSpace(dto.Unit) ? "Chiếc" : dto.Unit.Trim(),
                     dto.CostPrice,
                     dto.SalePrice,
-                    dto.CurrentStock,
                     dto.MinStockAlert,
                     dto.SquishyType,
                     dto.MainImageUrl,
                     dto.IsActive,
                     KeepStock = keepStock
                 }, transaction);
+
+            // Sửa tay số lượng (sản phẩm không chia màu): cộng/trừ phần chênh lệch và ghi thẻ kho
+            if (!keepStock)
+            {
+                if (dto.CurrentStock < 0)
+                {
+                    transaction.Rollback();
+                    return new RestData<ProductDto> { IsSuccess = false, Message = "Số lượng tồn kho không được âm." };
+                }
+                var delta = dto.CurrentStock - (dto.OriginalStock ?? current.CurrentStock);
+                if (delta != 0)
+                    await Inventory.ChangeAsync(connection, transaction, id, null, delta, "ADJUST", null,
+                        $"Sửa tay số lượng tồn kho ({(delta > 0 ? "+" : "")}{delta})");
+            }
 
             // Cập nhật lại media nếu truyền vào danh sách
             await SyncProductMediaAsync(connection, transaction, id, dto.ImageUrls, dto.VideoUrls);
@@ -375,6 +387,7 @@ public class ProductService : IProductService
     /// Lưu danh sách màu của sản phẩm. Trả về lỗi hoặc null.
     /// - Màu mới: tạo với tồn đầu kỳ (ghi thẻ kho "OPENING").
     /// - Sản phẩm đang có hàng mà chưa chia màu: tồn hiện có chuyển sang màu đầu tiên ("VARIANT_SPLIT").
+    /// - Màu đã có: sửa tay số lượng → cộng/trừ phần chênh lệch ("ADJUST").
     /// - Màu bị bỏ khỏi danh sách: chỉ xóa được khi đã hết hàng.
     /// </summary>
     private static async Task<string?> SyncVariantsAsync(IDbConnection connection, IDbTransaction transaction, Guid productId,
@@ -391,6 +404,7 @@ public class ProductService : IProductService
             if (v.ColorHex != null && !Regex.IsMatch(v.ColorHex, "^#[0-9A-Fa-f]{6}$"))
                 return $"Mã màu của \"{v.Name}\" không hợp lệ.";
             if (v.InitialStock < 0) return $"Tồn đầu kỳ của \"{v.Name}\" không được âm.";
+            if (v.Stock < 0) return $"Số lượng của \"{v.Name}\" không được âm.";
         }
         var dup = incoming.GroupBy(v => v.Name.ToLowerInvariant()).FirstOrDefault(g => g.Count() > 1);
         if (dup != null) return $"Màu \"{dup.First().Name}\" bị trùng tên.";
@@ -419,6 +433,16 @@ public class ProductService : IProductService
                 await connection.ExecuteAsync(@"UPDATE ProductVariant SET Name = @Name, ColorHex = @ColorHex, ImageUrl = @ImageUrl,
                         DisplayOrder = @Order, IsActive = @IsActive, UpdatedAt = GETDATE() WHERE Id = @Id",
                     new { Id = variantId, v.Name, v.ColorHex, v.ImageUrl, Order = order, v.IsActive }, transaction);
+
+                // Sửa tay số lượng của màu: cộng/trừ phần chênh lệch so với lúc mở form
+                if (v.Stock.HasValue)
+                {
+                    var saved = existing.First(e => e.Id == variantId);
+                    var delta = v.Stock.Value - (v.OriginalStock ?? saved.CurrentStock);
+                    if (delta != 0)
+                        await Inventory.ChangeAsync(connection, transaction, productId, variantId, delta, "ADJUST", null,
+                            $"Sửa tay số lượng màu {v.Name} ({(delta > 0 ? "+" : "")}{delta})");
+                }
             }
             else
             {

@@ -29,6 +29,8 @@ public class Order
 
     // Khâu chuẩn bị & đóng hàng (Fulfillment)
     public string PreparationStatus { get; set; } = "PENDING"; // PENDING, PREPARING, PACKED, SHIPPED
+    /// <summary>Đã trừ kho cho đơn chưa (tránh trừ 2 lần / hoàn kho nhầm). Xem Inventory.DeductOrderAsync.</summary>
+    public bool IsStockDeducted { get; set; }
     public string? PreparationNote { get; set; }
     public string? PackingChecklistJson { get; set; }
 

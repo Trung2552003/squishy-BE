@@ -259,14 +259,15 @@ public class OrderService : IOrderService
                 PaidAt = isCash ? DateTime.Now : null,
                 PaymentProofImageUrl = request.PaymentProofImageUrl,
                 Note = request.Note,
+                IsStockDeducted = isCash, // tiền mặt tại quầy: đã trừ kho ở vòng lặp trên
                 CreatedAt = DateTime.Now,
                 UpdatedAt = DateTime.Now,
                 IsDeleted = false
             };
 
             var insertOrderSql = @"
-                INSERT INTO [Order] (Id, OrderCode, CustomerName, CustomerPhone, OrderType, SubTotal, DiscountAmount, TotalAmount, PaymentMethod, PaymentStatus, OrderStatus, ShippingAddress, ShippingProvider, TrackingCode, ShippingFee, ShippingPayer, PreparationStatus, TransferContent, PaidAt, PaymentProofImageUrl, Note, CreatedAt, UpdatedAt, IsDeleted)
-                VALUES (@Id, @OrderCode, @CustomerName, @CustomerPhone, @OrderType, @SubTotal, @DiscountAmount, @TotalAmount, @PaymentMethod, @PaymentStatus, @OrderStatus, @ShippingAddress, @ShippingProvider, @TrackingCode, @ShippingFee, @ShippingPayer, @PreparationStatus, @TransferContent, @PaidAt, @PaymentProofImageUrl, @Note, @CreatedAt, @UpdatedAt, @IsDeleted)";
+                INSERT INTO [Order] (Id, OrderCode, CustomerName, CustomerPhone, OrderType, SubTotal, DiscountAmount, TotalAmount, PaymentMethod, PaymentStatus, OrderStatus, ShippingAddress, ShippingProvider, TrackingCode, ShippingFee, ShippingPayer, PreparationStatus, TransferContent, PaidAt, PaymentProofImageUrl, Note, IsStockDeducted, CreatedAt, UpdatedAt, IsDeleted)
+                VALUES (@Id, @OrderCode, @CustomerName, @CustomerPhone, @OrderType, @SubTotal, @DiscountAmount, @TotalAmount, @PaymentMethod, @PaymentStatus, @OrderStatus, @ShippingAddress, @ShippingProvider, @TrackingCode, @ShippingFee, @ShippingPayer, @PreparationStatus, @TransferContent, @PaidAt, @PaymentProofImageUrl, @Note, @IsStockDeducted, @CreatedAt, @UpdatedAt, @IsDeleted)";
             await connection.ExecuteAsync(insertOrderSql, order, transaction);
 
             var insertDetailSql = @"
@@ -332,32 +333,30 @@ public class OrderService : IOrderService
             }
         }
 
-        if (newOrderStatus == "COMPLETED" && order.OrderStatus != "COMPLETED")
-        {
-            var details = await connection.QueryAsync<OrderDetail>("SELECT * FROM OrderDetail WHERE OrderId = @Id", new { Id = id });
-            foreach (var item in details)
-            {
-                await Inventory.ChangeAsync(connection, null, item.ProductId, item.VariantId, -item.Quantity, "EXPORT", order.OrderCode,
-                    $"Xuất bán đơn hàng {order.OrderCode}");
-            }
-        }
-        else if (newOrderStatus == "CANCELLED" && (order.OrderStatus == "COMPLETED" || order.PaymentStatus == "PAID"))
-        {
-            var details = await connection.QueryAsync<OrderDetail>("SELECT * FROM OrderDetail WHERE OrderId = @Id", new { Id = id });
-            foreach (var item in details)
-            {
-                await Inventory.ChangeAsync(connection, null, item.ProductId, item.VariantId, item.Quantity, "ORDER_CANCEL", order.OrderCode,
-                    $"Hoàn kho do hủy đơn {order.OrderCode}");
-            }
-        }
-
         DateTime? paidAt = (newPaymentStatus == "PAID" && order.PaidAt == null) ? DateTime.Now : order.PaidAt;
 
-        await connection.ExecuteAsync(@"
-            UPDATE [Order] 
-            SET OrderStatus = @OrderStatus, PaymentStatus = @PaymentStatus, PaidAt = @PaidAt, UpdatedAt = GETDATE()
-            WHERE Id = @Id",
-            new { Id = id, OrderStatus = newOrderStatus, PaymentStatus = newPaymentStatus, PaidAt = paidAt });
+        // Kho + trạng thái trong cùng 1 giao dịch; cờ IsStockDeducted đảm bảo không trừ / hoàn kho 2 lần
+        connection.Open();
+        using (var transaction = connection.BeginTransaction())
+        {
+            if (newOrderStatus == "COMPLETED")
+            {
+                var error = await Inventory.DeductOrderAsync(connection, transaction, id, order.OrderCode,
+                    $"Xuất bán đơn hàng {order.OrderCode}", requireStock: false);
+                if (error != null) { transaction.Rollback(); return FailOrder(error); }
+            }
+            else if (newOrderStatus == "CANCELLED")
+            {
+                await Inventory.RestockOrderAsync(connection, transaction, id, order.OrderCode, $"Hoàn kho do hủy đơn {order.OrderCode}");
+            }
+
+            await connection.ExecuteAsync(@"
+                UPDATE [Order] 
+                SET OrderStatus = @OrderStatus, PaymentStatus = @PaymentStatus, PaidAt = @PaidAt, UpdatedAt = GETDATE()
+                WHERE Id = @Id",
+                new { Id = id, OrderStatus = newOrderStatus, PaymentStatus = newPaymentStatus, PaidAt = paidAt }, transaction);
+            transaction.Commit();
+        }
 
         return await GetByIdAsync(id);
     }
@@ -365,12 +364,16 @@ public class OrderService : IOrderService
     public async Task<RestData<OrderDto>> UpdateFulfillmentAsync(Guid id, UpdateFulfillmentRequest request)
     {
         using var connection = _connectionFactory.CreateConnection();
-        var orderType = await connection.ExecuteScalarAsync<string?>(
-            "SELECT OrderType FROM [Order] WHERE Id = @Id AND IsDeleted = 0", new { Id = id });
-        if (orderType == null)
+        var current = await connection.QueryFirstOrDefaultAsync<Order>(
+            "SELECT * FROM [Order] WHERE Id = @Id AND IsDeleted = 0", new { Id = id });
+        if (current == null)
             return FailOrder("Không tìm thấy đơn hàng.");
-        if (orderType == "POS")
+        if (current.OrderType == "POS")
             return FailOrder("Đơn bán tại quầy đã giao tận tay khách, không cần đóng gói / giao shipper.");
+        if (current.OrderStatus is "CANCELLED" or "RETURNED")
+            return FailOrder("Đơn đã hủy / đã hoàn hàng, không cập nhật đóng gói được.");
+
+        // Kho chỉ trừ khi đơn được bấm "Hoàn thành" (UpdateStatusAsync), đóng gói / giao shipper không đổi tồn kho
         var sql = @"
             UPDATE [Order] 
             SET PreparationStatus = @PreparationStatus,

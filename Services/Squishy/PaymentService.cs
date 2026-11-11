@@ -244,13 +244,9 @@ public class PaymentService : IPaymentService
                     return await FinishAsync(connection, payload, rawBody, "DUPLICATE", $"Đơn {order.OrderCode} vừa được xác nhận bởi yêu cầu khác.", order.Id);
                 }
 
-                var details = await connection.QueryAsync<OrderDetail>(
-                    "SELECT * FROM OrderDetail WHERE OrderId = @OrderId", new { OrderId = order.Id }, transaction);
-                foreach (var item in details)
-                {
-                    await Inventory.ChangeAsync(connection, transaction, item.ProductId, item.VariantId, -item.Quantity, "EXPORT", order.OrderCode,
-                        $"Xuất bán đơn hàng {order.OrderCode} qua SePay");
-                }
+                // Đơn đã trừ kho trước đó (VD đã bấm hoàn thành): helper tự bỏ qua, không trừ 2 lần
+                await Inventory.DeductOrderAsync(connection, transaction, order.Id, order.OrderCode,
+                    $"Xuất bán đơn hàng {order.OrderCode} qua SePay", requireStock: false);
 
                 transaction.Commit();
             }

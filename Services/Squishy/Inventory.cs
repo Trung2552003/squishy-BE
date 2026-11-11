@@ -106,6 +106,46 @@ public static class Inventory
         return (before, after);
     }
 
+    /// <summary>
+    /// Trừ kho cả đơn đúng 1 lần, dựa vào cờ Order.IsStockDeducted (bấm hoàn thành, SePay báo tiền
+    /// đều gọi vào đây nên không bao giờ trừ 2 lần). requireStock: báo lỗi khi thiếu hàng thay vì trừ về 0.
+    /// Trả về lỗi (tiếng Việt) hoặc null.
+    /// </summary>
+    public static async Task<string?> DeductOrderAsync(IDbConnection connection, IDbTransaction transaction,
+        Guid orderId, string orderCode, string note, bool requireStock)
+    {
+        var claimed = await connection.ExecuteAsync(
+            "UPDATE [Order] SET IsStockDeducted = 1 WHERE Id = @Id AND IsStockDeducted = 0", new { Id = orderId }, transaction);
+        if (claimed == 0) return null; // đã trừ trước đó
+
+        var lines = await connection.QueryAsync<(Guid ProductId, Guid? VariantId, int Quantity, string ProductName)>(
+            "SELECT ProductId, VariantId, Quantity, ProductName FROM OrderDetail WHERE OrderId = @Id", new { Id = orderId }, transaction);
+        foreach (var line in lines)
+        {
+            if (requireStock)
+            {
+                var stock = await GetStockAsync(connection, transaction, line.ProductId, line.VariantId);
+                if (stock < line.Quantity)
+                    return $"\"{line.ProductName}\" chỉ còn {stock} chiếc trong kho, đơn cần {line.Quantity}. Hãy nhập thêm hàng hoặc sửa đơn.";
+            }
+            await ChangeAsync(connection, transaction, line.ProductId, line.VariantId, -line.Quantity, "EXPORT", orderCode, note);
+        }
+        return null;
+    }
+
+    /// <summary>Hoàn kho cả đơn khi hủy, chỉ khi đơn đã từng trừ kho.</summary>
+    public static async Task RestockOrderAsync(IDbConnection connection, IDbTransaction transaction, Guid orderId, string orderCode, string note)
+    {
+        var released = await connection.ExecuteAsync(
+            "UPDATE [Order] SET IsStockDeducted = 0 WHERE Id = @Id AND IsStockDeducted = 1", new { Id = orderId }, transaction);
+        if (released == 0) return;
+
+        var lines = await connection.QueryAsync<(Guid ProductId, Guid? VariantId, int Quantity)>(
+            "SELECT ProductId, VariantId, Quantity FROM OrderDetail WHERE OrderId = @Id", new { Id = orderId }, transaction);
+        foreach (var line in lines)
+            await ChangeAsync(connection, transaction, line.ProductId, line.VariantId, line.Quantity, "ORDER_CANCEL", orderCode, note);
+    }
+
     /// <summary>Ghi thẻ kho không làm đổi số lượng (VD nhận hàng lỗi khách trả).</summary>
     public static async Task LogAsync(IDbConnection connection, IDbTransaction? transaction,
         Guid productId, Guid? variantId, string type, string? reference, string note)
